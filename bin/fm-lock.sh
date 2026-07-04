@@ -14,20 +14,21 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 LOCK="$STATE/.lock"
 mkdir -p "$STATE"
 
-# Known harness command names; extend when a new adapter is verified.
-HARNESS_RE='claude|codex|opencode|grok|^pi$'
+# Known harness command names; omp is Oh My Pi and runs via bun.
+HARNESS_RE='claude|codex|opencode|grok|^pi$|(^|[[:space:]/])omp($|[[:space:]])'
 
 harness_pid() {
-  local pid=$$ comm args
+  local pid=$$ comm base args
   for _ in 1 2 3 4 5 6 7 8; do
     comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
+    base=${comm##*/}
     args=$(ps -o args= -p "$pid" 2>/dev/null)
-    if printf '%s' "$(basename "$comm")" | grep -qE "$HARNESS_RE"; then
+    if printf '%s' "$base" | grep -qE "$HARNESS_RE"; then
       echo "$pid"; return 0
     fi
     # Bare interpreter (e.g. node): match the harness name in its script path.
     case "$comm" in
-      *node*|*python*) printf '%s' "$args" | grep -qE "$HARNESS_RE" && { echo "$pid"; return 0; } ;;
+      *node*|*python*|*bun*) printf '%s' "$args" | grep -qE "$HARNESS_RE" && { echo "$pid"; return 0; } ;;
     esac
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
     [ -n "$pid" ] && [ "$pid" -gt 1 ] || return 1
@@ -36,10 +37,11 @@ harness_pid() {
 }
 
 holder_alive() {  # true if $1 is a live process that looks like a harness
-  local pid=$1 comm
+  local pid=$1 comm base
   kill -0 "$pid" 2>/dev/null || return 1
   comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-  printf '%s' "$(basename "$comm") $(ps -o args= -p "$pid" 2>/dev/null)" | grep -qE "$HARNESS_RE"
+  base=${comm##*/}
+  printf '%s' "$base $(ps -o args= -p "$pid" 2>/dev/null)" | grep -qE "$HARNESS_RE"
 }
 
 if [ "${1:-}" = "status" ]; then
