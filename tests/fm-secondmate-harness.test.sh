@@ -45,10 +45,11 @@ export FM_BACKEND=tmux
 # ===========================================================================
 # A) fm-harness.sh secondmate resolution + fallback (deterministic detect_own)
 # ===========================================================================
-# detect_own is pinned to claude via CLAUDECODE=1 so the "fall through to own"
-# cases are reproducible. Each row sets crew-harness / secondmate-harness in a
-# fresh config dir (a literal '-' means leave the file absent) and asserts BOTH
-# the secondmate resolution AND that crew resolution is unchanged (backward-compat).
+# detect_own is pinned to claude via CLAUDECODE=1 with competing harness markers
+# cleared, so the "fall through to own" cases are reproducible. Each row sets
+# crew-harness / secondmate-harness in a fresh config dir (a literal '-' means
+# leave the file absent) and asserts BOTH the secondmate resolution AND that crew
+# resolution is unchanged (backward-compat).
 #   <label>^<crew-harness>^<secondmate-harness>^<expect-secondmate>^<expect-crew>
 test_harness_resolution() {
   local label crew sm exp_sm exp_crew case_dir cfg got_sm got_crew n
@@ -61,8 +62,8 @@ test_harness_resolution() {
     mkdir -p "$cfg"
     [ "$crew" = "-" ] || printf '%s\n' "$crew" > "$cfg/crew-harness"
     [ "$sm" = "-" ] || printf '%s\n' "$sm" > "$cfg/secondmate-harness"
-    got_sm=$(CLAUDECODE=1 FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" secondmate)
-    got_crew=$(CLAUDECODE=1 FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" crew)
+    got_sm=$(env -u OMPCODE CLAUDECODE=1 FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" secondmate)
+    got_crew=$(env -u OMPCODE CLAUDECODE=1 FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" crew)
     [ "$got_sm" = "$exp_sm" ] || fail "$label: secondmate resolved '$got_sm', expected '$exp_sm'"
     [ "$got_crew" = "$exp_crew" ] || fail "$label: crew resolved '$got_crew', expected '$exp_crew'"
   done <<'ROWS'
@@ -96,9 +97,9 @@ test_secondmate_model_effort_tokens() {
     cfg="$case_dir/config"
     mkdir -p "$cfg"
     [ "$line" = ABSENT ] || printf '%b\n' "$line" > "$cfg/secondmate-harness"
-    got_h=$(CLAUDECODE=1 FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" secondmate)
-    got_m=$(CLAUDECODE=1 FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" secondmate-model)
-    got_e=$(CLAUDECODE=1 FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" secondmate-effort)
+    got_h=$(env -u OMPCODE CLAUDECODE=1 FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" secondmate)
+    got_m=$(env -u OMPCODE CLAUDECODE=1 FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" secondmate-model)
+    got_e=$(env -u OMPCODE CLAUDECODE=1 FM_CONFIG_OVERRIDE="$cfg" "$ROOT/bin/fm-harness.sh" secondmate-effort)
     [ "$got_h" = "$exp_harness" ] || fail "$label: harness resolved '$got_h', expected '$exp_harness'"
     [ "$got_m" = "$exp_model" ] || fail "$label: model resolved '$got_m', expected '$exp_model'"
     [ "$got_e" = "$exp_effort" ] || fail "$label: effort resolved '$got_e', expected '$exp_effort'"
@@ -261,9 +262,10 @@ make_seeded_home() {
 
 # spawn_secondmate <world> <id> <home> [explicit-harness]
 # Runs fm-spawn.sh in secondmate mode. FM_ROOT is the real repo (so fm-harness.sh
-# resolves), the primary config dir is <world>/home/config, and CLAUDECODE pins
-# detect_own. stderr is discarded (the local-HEAD ff sync harmlessly skips a
-# non-worktree home). Inspect <world>/home/state/<id>.meta and <home>/config after.
+# resolves), the primary config dir is <world>/home/config, and CLAUDECODE with
+# OMPCODE cleared pins detect_own. stderr is discarded (the local-HEAD ff sync
+# harmlessly skips a non-worktree home). Inspect <world>/home/state/<id>.meta and
+# <home>/config after.
 spawn_secondmate() {
   local world=$1 id=$2 home=$3 harness=${4:-} fakebin
   mkdir -p "$world/home/state" "$world/home/data"
@@ -273,7 +275,7 @@ spawn_secondmate() {
   local spawn_args=("$id" "$home")
   [ -n "$harness" ] && spawn_args+=("$harness")
   spawn_args+=(--secondmate)
-  PATH="$fakebin:$BASE_PATH" TMUX='' CLAUDECODE=1 \
+  env -u OMPCODE PATH="$fakebin:$BASE_PATH" TMUX='' CLAUDECODE=1 \
     FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$world/home" \
     FM_STATE_OVERRIDE="$world/home/state" FM_DATA_OVERRIDE="$world/home/data" \
     FM_PROJECTS_OVERRIDE="$world/home/projects" FM_CONFIG_OVERRIDE="$world/home/config" \
@@ -383,7 +385,7 @@ test_spawn_unverified_secondmate_harness_refused() {
   fakebin=$(make_noop_tmux "$w/tmux")
   err="$w/spawn.err"
   rc=0
-  PATH="$fakebin:$BASE_PATH" TMUX='' CLAUDECODE=1 \
+  env -u OMPCODE PATH="$fakebin:$BASE_PATH" TMUX='' CLAUDECODE=1 \
     FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$w/home" \
     FM_STATE_OVERRIDE="$w/home/state" FM_DATA_OVERRIDE="$w/home/data" \
     FM_PROJECTS_OVERRIDE="$w/home/projects" FM_CONFIG_OVERRIDE="$w/home/config" \
@@ -453,7 +455,7 @@ spawn_secondmate_capture() {
   mkdir -p "$world/home/state" "$world/home/data"
   fakebin=$(make_launch_capturing_tmux "$world/tmux-$id")
   : > "$launchlog"
-  PATH="$fakebin:$BASE_PATH" TMUX='' CLAUDECODE=1 \
+  env -u OMPCODE PATH="$fakebin:$BASE_PATH" TMUX='' CLAUDECODE=1 \
     FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$world/home" \
     FM_STATE_OVERRIDE="$world/home/state" FM_DATA_OVERRIDE="$world/home/data" \
     FM_PROJECTS_OVERRIDE="$world/home/projects" FM_CONFIG_OVERRIDE="$world/home/config" \
@@ -658,7 +660,7 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
   mkdir -p "$home/data/$id" "$home/projects" "$home/state"
   printf 'brief\n' > "$home/data/$id/brief.md"
   : > "$launchlog"
-  PATH="$fakebin:$BASE_PATH" TMUX="fake,1,0" CLAUDECODE=1 \
+  env -u OMPCODE PATH="$fakebin:$BASE_PATH" TMUX="fake,1,0" CLAUDECODE=1 \
     FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \

@@ -115,9 +115,10 @@ fm_tmux_strip_ghost() {
 # the single composer row (-S/-E), then run through fm_tmux_strip_ghost so dim/faint
 # ghost text drops out before classification. The styled capture is internal only,
 # never surfaced. The detector then strips the harness's box-drawing composer
-# borders ("│ … │", heavy "┃", or a plain ASCII "|") using literal-string
-# substitution (bash 3.2 safe, locale-independent — no \u escapes, no multibyte
-# character classes), and asks whether anything real is left.
+# borders ("│ … │", heavy "┃", a plain ASCII "|", or omp's rounded "╰─ … ─╯")
+# using literal-string substitution (bash 3.2 safe, locale-independent — no \u
+# escapes, no multibyte character classes), and asks whether anything real is
+# left.
 fm_tmux_composer_state() {  # <target> -> empty|pending|unknown
   local target=$1 cy raw line stripped
   cy=$(tmux display-message -p -t "$target" '#{cursor_y}' 2>/dev/null) || { printf 'unknown'; return 0; }
@@ -128,6 +129,11 @@ fm_tmux_composer_state() {  # <target> -> empty|pending|unknown
   stripped=${line//│/}      # U+2502 light vertical (claude)
   stripped=${stripped//┃/}  # U+2503 heavy vertical
   stripped=${stripped//|/}  # ASCII pipe
+  stripped=${stripped//╭/}  # U+256D rounded top-left (omp)
+  stripped=${stripped//╮/}  # U+256E rounded top-right (omp)
+  stripped=${stripped//╰/}  # U+2570 rounded bottom-left (omp)
+  stripped=${stripped//╯/}  # U+256F rounded bottom-right (omp)
+  stripped=${stripped//─/}  # U+2500 horizontal rule (omp box)
   # Trim surrounding whitespace.
   stripped="${stripped#"${stripped%%[![:space:]]*}"}"
   stripped="${stripped%"${stripped##*[![:space:]]}"}"

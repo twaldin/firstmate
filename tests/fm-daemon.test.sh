@@ -620,6 +620,31 @@ test_pane_input_pending_bordered_with_text_is_pending() {
   pass "pane_input_pending: text inside a bordered composer is still pending"
 }
 
+test_pane_input_pending_omp_rounded_idle_not_pending() {
+  # omp draws a rounded bottom input border with no prompt glyph. When no text
+  # is typed, only rounded-box structure and whitespace remain.
+  local dir state fakebin capture
+  dir=$(make_supercase pending-omp-rounded-idle)
+  state="$dir/state"; fakebin="$dir/fakebin"; capture="$dir/pane.txt"
+  printf '%s\n' "╰─                                            ─╯" > "$capture"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=0 \
+    pane_input_pending "fakepane" \
+    && fail "idle omp rounded composer falsely detected as pending"
+  pass "pane_input_pending: an idle omp rounded composer is NOT pending"
+}
+
+test_pane_input_pending_omp_rounded_with_text_is_pending() {
+  # Guard against stripping too much: real input starts right after "╰─ " in omp.
+  local dir state fakebin capture
+  dir=$(make_supercase pending-omp-rounded-text)
+  state="$dir/state"; fakebin="$dir/fakebin"; capture="$dir/pane.txt"
+  printf '%s\n' "╰─ hello ─╯" > "$capture"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_CAPTURE="$capture" FM_FAKE_TMUX_CURSOR_Y=0 \
+    pane_input_pending "fakepane" \
+    || fail "real text inside an omp rounded composer was not detected as pending"
+  pass "pane_input_pending: text inside an omp rounded composer is still pending"
+}
+
 test_submit_ack_confirms_on_bordered_empty_composer() {
   # RC2: the submit acknowledgement must recognize a bordered-EMPTY composer as
   # "submitted." The old ACK reused the broken check, so on claude it could never
@@ -1003,6 +1028,8 @@ test_classify_signal_dedup_against_scan
 test_classify_stale_dedup_against_signal
 test_pane_input_pending_bordered_idle_not_pending
 test_pane_input_pending_bordered_with_text_is_pending
+test_pane_input_pending_omp_rounded_idle_not_pending
+test_pane_input_pending_omp_rounded_with_text_is_pending
 test_submit_ack_confirms_on_bordered_empty_composer
 test_submit_ack_reports_pending_on_persistent_swallow
 test_max_defer_empty_swallow_types_once_and_alarms
