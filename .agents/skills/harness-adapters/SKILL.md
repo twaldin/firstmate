@@ -1,6 +1,6 @@
 ---
 name: harness-adapters
-description: Agent-only reference for firstmate harness operations. Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter. Contains verified facts for claude, codex, opencode, pi, and grok.
+description: Agent-only reference for firstmate harness operations. Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter. Contains verified facts for claude, codex, opencode, pi, grok, and omp.
 user-invocable: false
 metadata:
   internal: true
@@ -57,6 +57,7 @@ The supported launch-profile flags below were verified locally on 2026-06-30 wit
 | codex | `--model <model>` | `-c 'model_reasoning_effort="<low\|medium\|high\|xhigh>"'` | Verified on codex-cli 0.142.1. The installed binary schema contains `model_reasoning_effort`, the active config uses it, and the bundled model catalog advertises only low/medium/high/xhigh. `max` is omitted. |
 | grok | `--model <model>` | `--reasoning-effort <low\|medium\|high\|xhigh>` | Verified on grok 0.2.73. `--effort` parses too, but firstmate's profile axis is reasoning effort. `--reasoning-effort max` is rejected, so `max` is omitted. |
 | pi | `--model <model>` | `--thinking <low\|medium\|high\|xhigh>` | Verified on pi 0.80.2. `max` prints an invalid-thinking warning, so firstmate omits Pi effort when the requested effort is `max`. |
+| omp | `--model <model>` | `--thinking <low\|medium\|high\|xhigh>` | Verified on omp 16.3.6. `--thinking` accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `auto`; firstmate omits effort when the requested effort is `max`. |
 | opencode | `--model <provider/model>` | none for firstmate's interactive launch | Verified on opencode 1.17.6. `opencode run` has `--variant`, but firstmate launches the interactive `opencode --prompt` path, which has no verified effort flag. |
 
 When a requested effort value is outside the harness-specific accepted set, `fm-spawn` records the requested `effort=` in meta but emits no effort flag for that harness.
@@ -72,6 +73,7 @@ Natural language is acceptable if uncertain.
 - opencode: no separate verified skill invocation beyond normal slash-command behavior; use natural language if the exact skill command is uncertain.
 - pi: no separate verified skill invocation beyond normal command behavior; use natural language if the exact skill command is uncertain.
 - grok: `/<skill>`, for example `/no-mistakes` (same form as claude). Verified end to end: grok discovers the user-level `no-mistakes` skill, `/no-mistakes` invokes it, and grok drives a real `no-mistakes axi run`. Like codex's `$`/`/` popups, typing `/<skill>` opens grok's slash-autocomplete, so a too-fast Enter selects the popup entry instead of sending, and for an argument-taking command (like `/no-mistakes`'s optional task-first argument) that first Enter only expands the popup selection into an argument-hint placeholder rather than submitting - a genuine second Enter is required (see the grok section below for the 2026-07-03 incident and fix). `fm_tmux_submit_core`'s retried Enter (used by `fm-send` on the tmux backend) already handles this correctly by reading the cursor row; the herdr backend needed a dedicated fix (`fm_backend_herdr_composer_state`, docs/herdr-backend.md) because its prior delta-based verification false-positived on that same popup-close content change.
+- omp: `/<skill>` only when it is line-leading, for example `/no-mistakes`. Mid-prompt `/skill` is broken in omp 16.3.6. Like other slash-command TUIs, the first Enter may select or complete the slash popup instead of submitting; rely on `fm-send`'s submit retry rather than a single blind Enter.
 
 ## claude (VERIFIED)
 
@@ -155,6 +157,30 @@ The decision persists per path in `~/.pi/agent/trust.json`, so later spawns in t
 `fm-spawn` keeps the turn-end extension in `state/`, outside the worktree, because project-local extension files make the trust gate strictly worse and pollute the project.
 The extension must listen for pi's `turn_end` event, not `agent_end`, so the watcher wakes after each completed turn instead of only when the whole agent run exits.
 Pi sets `PI_CODING_AGENT=true` for its children; this is its harness-detection env marker.
+
+## omp (VERIFIED 2026-07-05, omp 16.3.6)
+
+Oh My Pi TUI (`omp`), installed here as `bun ~/.bun/bin/omp`.
+Launch with a positional prompt: `bun "$HOME/.bun/bin/omp" --auto-approve --hook <state-ext> "$(cat <brief>)"` for crewmate and scout tasks.
+Secondmate launches omit `--hook` because idle secondmate panes are healthy and should not create stale-pane turn wakes.
+
+| Fact | Value |
+|---|---|
+| Busy-pane signature | `⟨esc⟩` (the mid-turn cancel hint in OMP's status line, shown iff a turn is running; observed as `⠹ Working… ⟨esc⟩` while planning and `⠴ Sleeping 5 seconds ⟨esc⟩` while a bash tool was running). The busy regex uses the cancel hint instead of the changing status verb. |
+| Exit command | `/exit` or `/quit`; `Ctrl+D` is the default `app.exit` keybinding. |
+| Interrupt | single Escape (`app.interrupt` default); if a slash popup is focused, the first Escape may dismiss that UI rather than cancel the turn. |
+| Skill invocation | Line-leading `/<skill>` only, for example `/no-mistakes`. Mid-prompt `/skill` is broken in 16.3.6. |
+| Autonomy | `--auto-approve` auto-approves tool execution. |
+| Env marker | `OMPCODE=1`. OMP also sets `CLAUDECODE=1`, so detection must check `OMPCODE` before `CLAUDECODE`. |
+| Resume | `omp --resume <session-id>` / `omp -r <session-id>`, or `omp --continue` / `omp -c` for the previous session. |
+
+Turn-end hook: OMP loads explicit extension paths with `--hook` (same loader as `--extension` / `-e`).
+`fm-spawn` writes a firstmate-owned extension at `state/<id>.omp-ext.ts`, outside the worktree, and the extension listens for OMP's `turn_end` event before touching `state/<id>.turn-ended`.
+`fm-teardown` removes that state extension.
+
+No project trust dialog was observed in scratch git worktrees under omp 16.3.6.
+The live verification environment showed startup MCP connection failures for some user connectors and an available OMP update banner; OMP continued and completed the task, so neither blocks firstmate launch supervision.
+OMP uses a rounded composer box; `fm-tmux-lib` strips the `╭`, `╮`, `╰`, `╯`, and `─` structural borders before composer-state checks.
 
 ## grok (VERIFIED 2026-06-29, grok 0.2.73; slash-submit behavior re-verified 2026-07-03, grok 0.2.82)
 

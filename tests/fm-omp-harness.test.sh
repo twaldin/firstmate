@@ -135,6 +135,22 @@ exit 1
   pass "fm-harness detects omp through bun ancestry"
 }
 
+test_omp_busy_regex_matches_real_status_lines() {
+  local regex
+  # shellcheck source=bin/fm-tmux-lib.sh
+  . "$ROOT/bin/fm-tmux-lib.sh"
+  regex=$FM_TMUX_BUSY_REGEX_DEFAULT
+
+  printf '%s\n' '⠹ Working… ⟨esc⟩' | grep -qiE "$regex" \
+    || fail "busy regex did not match omp model status line"
+  printf '%s\n' '⠴ Sleeping 5 seconds ⟨esc⟩' | grep -qiE "$regex" \
+    || fail "busy regex did not match omp tool status line"
+  if printf '%s\n' 'Done — sleep 5 completed successfully.' | grep -qiE "$regex"; then
+    fail "busy regex matched an idle omp completion line"
+  fi
+  pass "busy regex matches real omp cancel-hint status lines only"
+}
+
 test_fm_lock_recognizes_omp_holder
 test_fm_lock_acquire_finds_omp_harness_pid
 test_fm_lock_dash_comm_is_safe_and_continues
@@ -142,3 +158,4 @@ test_fm_lock_does_not_false_match_omp_substrings
 test_fm_harness_uses_omp_env_marker
 test_fm_harness_prefers_omp_over_claudecode
 test_fm_harness_detects_omp_ancestry
+test_omp_busy_regex_matches_real_status_lines

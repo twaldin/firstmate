@@ -33,7 +33,7 @@
 #   profile consultation. A --secondmate spawn is exempt and resolves the SECONDMATE
 #   harness (config/secondmate-harness -> config/crew-harness -> own), so the
 #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
-#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|grok)
+#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|grok|omp)
 #   overrides it for this spawn (either kind). A non-flag string containing
 #   whitespace is treated as a RAW launch command - the escape hatch for verifying
 #   new adapters.
@@ -71,6 +71,8 @@
 #                  turn-end signal rides the launch command, e.g. codex -c notify=[...])
 #     __PIEXT__    absolute path to state/<task-id>.pi-ext.ts (pi turn-end extension,
 #                  written by this script; outside the worktree to avoid pi's trust gate)
+#     __OMPEXT__   absolute path to state/<task-id>.omp-ext.ts (omp turn-end extension,
+#                  written by this script; outside the worktree to avoid project pollution)
 # Per-harness turn-end hooks are installed automatically; some live outside the worktree.
 # grok uses a firstmate-owned global hook under ${GROK_HOME:-$HOME/.grok}/hooks
 # plus a gitignored .fm-grok-turnend worktree pointer and a state token.
@@ -268,7 +270,7 @@ FIRSTMATE_HOME=
 
 if [ "$KIND" = secondmate ]; then
   case "${POS[1]:-}" in
-    ''|claude|codex|opencode|pi|grok)
+    ''|claude|codex|opencode|pi|grok|omp)
       ARG3=${POS[1]:-}
       ;;
     *' '*)
@@ -329,6 +331,17 @@ launch_template() {
     # launch command - it is a Stop-event hook installed below (global hook +
     # per-task pointer), so the template is identical for ship/scout/secondmate.
     grok) printf '%s' 'grok --always-approve __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"' ;;
+    # omp (Oh My Pi): launched via bun because the installed shim lives at
+    # ~/.bun/bin/omp. --auto-approve skips tool permission prompts for unattended
+    # crewmates. The turn-end signal rides an explicit extension path for
+    # ship/scout tasks; secondmates skip it for the same reason as codex/pi.
+    omp)
+      if [ "$kind" = secondmate ]; then
+        printf '%s' 'bun "$HOME/.bun/bin/omp" --auto-approve __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"'
+      else
+        printf '%s' 'bun "$HOME/.bun/bin/omp" --auto-approve __MODELFLAG____EFFORTFLAG__--hook __OMPEXT__ "$(cat __BRIEF__)"'
+      fi
+      ;;
     *) return 1 ;;
   esac
 }
@@ -416,7 +429,7 @@ model_flag_for_harness() {
   local harness=$1 model=$2
   [ -n "$model" ] && [ "$model" != default ] || return 0
   case "$harness" in
-    claude|codex|opencode|pi|grok)
+    claude|codex|opencode|pi|grok|omp)
       printf -- '--model %s ' "$(shell_quote "$model")"
       ;;
   esac
@@ -450,6 +463,14 @@ effort_flag_for_harness() {
     pi)
       # pi accepts --thinking low|medium|high|xhigh. It warns and ignores max, so
       # omit max rather than passing a flag the installed CLI will reject as invalid.
+      case "$effort" in
+        low|medium|high|xhigh) printf -- '--thinking %s ' "$(shell_quote "$effort")" ;;
+      esac
+      ;;
+    omp)
+      # omp accepts --thinking off|minimal|low|medium|high|xhigh|auto. Firstmate's
+      # shared effort axis maps to the overlapping low|medium|high|xhigh subset;
+      # omit max rather than passing an unsupported thinking value.
       case "$effort" in
         low|medium|high|xhigh) printf -- '--thinking %s ' "$(shell_quote "$effort")" ;;
       esac
@@ -883,6 +904,18 @@ export default function (pi: any) {
 }
 EOF
       ;;
+    omp*)
+      # Written OUTSIDE the worktree and loaded explicitly with --hook. omp accepts
+      # extension factories through the same ExtensionAPI surface as Pi; the
+      # turn_end event fires after each completed assistant turn.
+      cat > "$STATE/$ID.omp-ext.ts" <<EOF
+// Firstmate turn-end signal; written by fm-spawn.
+import { execFile } from "node:child_process";
+export default function (pi: any) {
+  pi.on("turn_end", () => execFile("touch", ["$TURNEND"]));
+}
+EOF
+      ;;
     codex*)
       # codex: turn-end rides the launch command via -c notify=[...] and __TURNEND__.
       ;;
@@ -1000,6 +1033,7 @@ META_WINDOW=$T
 sq_brief=$(shell_quote "$BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
+sq_ompext=$(shell_quote "$STATE/$ID.omp-ext.ts")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
 EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
@@ -1007,6 +1041,7 @@ LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
 LAUNCH=${LAUNCH//__BRIEF__/$sq_brief}
 LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
 LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}
+LAUNCH=${LAUNCH//__OMPEXT__/$sq_ompext}
 if [ "$KIND" = secondmate ]; then
   sq_home=$(shell_quote "$PROJ_ABS")
   LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_HOME=$sq_home $LAUNCH"
