@@ -478,6 +478,22 @@ resolve_project_dir_arg() {
   esac
 }
 
+git_common_dir_abs() {
+  local repo=$1 common
+  common=$(git -C "$repo" rev-parse --git-common-dir 2>/dev/null) || return 1
+  case "$common" in
+    /*) ( cd "$common" && pwd -P ) ;;
+    *) ( cd "$repo/$common" && pwd -P ) ;;
+  esac
+}
+
+project_is_firstmate_repo() {
+  local project_common root_common
+  project_common=$(git_common_dir_abs "$1") || return 1
+  root_common=$(git_common_dir_abs "$FM_ROOT") || return 1
+  [ "$project_common" = "$root_common" ]
+}
+
 path_is_ancestor_of() {
   local ancestor=$1 path=$2
   [ -n "$ancestor" ] || return 1
@@ -678,7 +694,11 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 W="fm-$ID"
 case "$BACKEND" in
   tmux)
-    SES=$(fm_backend_tmux_container_ensure)
+    TMUX_SESSION=firstmate
+    if [ "$KIND" != secondmate ] && ! project_is_firstmate_repo "$PROJ_ABS"; then
+      TMUX_SESSION=$(fm_backend_tmux_project_session_name "$PROJ_ABS")
+    fi
+    SES=$(fm_backend_tmux_container_ensure "$TMUX_SESSION")
     T="$SES:$W"
     fm_backend_tmux_create_task "$SES" "$W" "$PROJ_ABS" || exit 1
     ;;

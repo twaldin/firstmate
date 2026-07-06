@@ -706,6 +706,20 @@ make_spawn_fakebin() {  # <dir> <fake-worktree-path> -> echoes fakebin dir
 set -u
 { printf 'tmux'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_TMUX_LOG:?}"
 case "\${1:-}" in
+  has-session)
+    target=
+    shift
+    while [ \$# -gt 0 ]; do
+      case "\$1" in
+        -t) shift; target=\${1:-} ;;
+      esac
+      shift || true
+    done
+    if [ -n "\${FM_FAKE_TMUX_MISSING_SESSION:-}" ] && [ "\$target" = "\$FM_FAKE_TMUX_MISSING_SESSION" ]; then
+      exit 1
+    fi
+    exit 0
+    ;;
   display-message)
     for a in "\$@"; do case "\$a" in *pane_current_path*) printf '%s\\n' "$wt"; exit 0 ;; esac; done
     printf 'firstmate\\n'; exit 0 ;;
@@ -733,7 +747,7 @@ test_spawn_conformance_old_vs_new() {
   local old_bin fb proj wt data id log_old log_new out_old out_new
   local state_old state_new config_old config_new
   old_bin=$(build_old_bin spawn-old)
-  proj="$TMP_ROOT/spawn-project"; wt="$TMP_ROOT/spawn-wt"; data="$TMP_ROOT/spawn-data"
+  proj="$TMP_ROOT/firstmate"; wt="$TMP_ROOT/spawn-wt"; data="$TMP_ROOT/spawn-data"
   id="spawnconform1"
   fm_git_worktree "$proj" "$wt" "fm/$id"
   fb=$(make_spawn_fakebin "$TMP_ROOT/spawn-fake" "$wt")
@@ -853,6 +867,75 @@ test_spawn_symlinked_project_prefix_avoids_false_refusal() {
   run_spawn_symlink_case physical physical
   run_spawn_symlink_case logical logical
   pass "fm-spawn.sh: a project reached through a symlinked prefix (e.g. macOS /tmp -> /private/tmp) does not trip the isolation guard's false refusal"
+}
+
+test_spawn_uses_project_tmux_session_and_auto_creates() {
+  local proj wt data id fb state config log out meta session
+  proj="$TMP_ROOT/cos analytics:prod"; wt="$TMP_ROOT/project-session-wt"; data="$TMP_ROOT/project-session-data"
+  id="projectsessz6"
+  session="cos-analytics-prod"
+  fm_git_worktree "$proj" "$wt" "fm/$id"
+  fb=$(make_spawn_fakebin "$TMP_ROOT/project-session-fake" "$wt")
+  mkdir -p "$data/$id"
+  printf 'project session brief\n' > "$data/$id/brief.md"
+  state="$TMP_ROOT/project-session-state"; config="$TMP_ROOT/project-session-config"
+  mkdir -p "$state" "$config"
+  log="$TMP_ROOT/project-session.log"
+
+  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$TMP_ROOT/unused-projects" FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
+    FM_TMUX_LOG="$log" FM_FAKE_TMUX_MISSING_SESSION="$session" \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$proj" claude 2>&1)
+  expect_code 0 $? "fm-spawn.sh should spawn into a project-named tmux session"$'\n'"$out"
+  assert_contains "$out" "window=$session:fm-$id" \
+    "spawn summary did not report the project-qualified tmux target"
+
+  meta="$state/$id.meta"
+  assert_grep "window=$session:fm-$id" "$meta" \
+    "spawn meta did not record the project-qualified tmux target"
+  assert_contains "$(cat "$log")" $'\x1f''display-message'$'\x1f''-p'$'\x1f''#S' \
+    "spawn did not check the ambient tmux session before targeting the project session"
+  assert_contains "$(cat "$log")" $'\x1f''has-session'$'\x1f''-t'$'\x1f'"$session" \
+    "spawn did not check for the project tmux session"
+  assert_contains "$(cat "$log")" $'\x1f''new-session'$'\x1f''-d'$'\x1f''-s'$'\x1f'"$session" \
+    "spawn did not auto-create the missing project tmux session"
+  assert_contains "$(cat "$log")" $'\x1f''new-window'$'\x1f''-d'$'\x1f''-t'$'\x1f'"$session"$'\x1f''-n'$'\x1f'"fm-$id" \
+    "spawn did not create the task window in the project tmux session"
+
+  rm -rf "/tmp/fm-$id"
+  pass "fm-spawn.sh: tmux ship tasks use a sanitized project session, auto-create it, and record session:window in meta"
+}
+
+test_spawn_secondmate_stays_in_firstmate_tmux_session() {
+  local home sub id fb state data config log out meta
+  home="$TMP_ROOT/secondmate-parent-home"; sub="$TMP_ROOT/secondmate-home"
+  id="smprojectsessz7"
+  state="$home/state"; data="$home/data"; config="$home/config"
+  mkdir -p "$state" "$data/$id" "$config" "$sub/bin" "$sub/data" "$sub/state" "$sub/config" "$sub/projects"
+  printf '# Firstmate\n' > "$sub/AGENTS.md"
+  printf '%s\n' "$id" > "$sub/.fm-secondmate-home"
+  printf 'secondmate charter\n' > "$sub/data/charter.md"
+  fb=$(make_spawn_fakebin "$TMP_ROOT/secondmate-session-fake" "$sub")
+  log="$TMP_ROOT/secondmate-session.log"
+
+  out=$(PATH="$fb:$PATH" FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$state" FM_DATA_OVERRIDE="$data" FM_CONFIG_OVERRIDE="$config" \
+    FM_PROJECTS_OVERRIDE="$home/projects" FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" \
+    FM_TMUX_LOG="$log" FM_FAKE_TMUX_MISSING_SESSION="$id" \
+    "$ROOT/bin/fm-spawn.sh" "$id" "$sub" codex --secondmate 2>&1)
+  expect_code 0 $? "secondmate spawn should stay in firstmate session"$'\n'"$out"
+
+  meta="$state/$id.meta"
+  assert_grep "window=firstmate:fm-$id" "$meta" \
+    "secondmate meta did not keep the direct-report window in firstmate"
+  assert_contains "$(cat "$log")" $'\x1f''new-window'$'\x1f''-d'$'\x1f''-t'$'\x1f''firstmate'$'\x1f''-n'$'\x1f'"fm-$id" \
+    "secondmate spawn did not create its window in the firstmate tmux session"
+  assert_not_contains "$(cat "$log")" $'\x1f''-t'$'\x1f'"$id" \
+    "secondmate spawn used the secondmate id as a tmux session"
+
+  rm -rf "/tmp/fm-$id"
+  pass "fm-spawn.sh: secondmate direct reports stay in the firstmate tmux session"
 }
 
 # --- old vs new: fm-teardown.sh ----------------------------------------------
@@ -1067,6 +1150,8 @@ test_send_conformance_old_vs_new
 test_peek_conformance_old_vs_new
 test_spawn_conformance_old_vs_new
 test_spawn_symlinked_project_prefix_avoids_false_refusal
+test_spawn_uses_project_tmux_session_and_auto_creates
+test_spawn_secondmate_stays_in_firstmate_tmux_session
 test_teardown_conformance_old_vs_new
 test_spawn_refuses_unknown_backend_flag
 test_spawn_refuses_codex_app_backend_flag
