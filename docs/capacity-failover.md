@@ -114,6 +114,28 @@ The helper never deletes those candidates.
 It does not kill those processes; callers own any stop/retry policy.
 `periodic-alert` emits a bounded disk-pressure alert for supervision and applies its own cooldown marker.
 
+## Shared GitHub Quota
+
+`bin/fm-shared-github-quota.sh` coordinates GitHub API quota as a fleet-wide shared resource.
+Its state is intentionally independent of any one `FM_HOME`.
+By default it uses `${XDG_STATE_HOME:-$HOME/.local/state}/firstmate/shared-github-quota/`; tests and unusual deployments can set `FM_SHARED_STATE_OVERRIDE`.
+
+Cooldown records are keyed by `(provider, account, route)`.
+The account comes from `--account`, `FM_GITHUB_ACCOUNT_ID`, a locally cached account learned from prior rate-limit evidence, or a best-effort `gh api user` derivation.
+`mark` and `mark-from-text` write the cooldown.
+`check` prints `state=allow` or `state=defer` with provider, account, route, reset time, and remaining seconds.
+Expired records are removed by `check`, so polling resumes only at or after the recorded reset time.
+
+`fm-pr-check.sh` uses this guard when it records PR metadata and in the static `fm-pr-poll.sh` poller.
+During a shared cooldown, PR pollers do not call `gh`.
+They return silence unless a cached PR state already proves `MERGED`; that preserves local ownership and avoids repeated wake spam while GitHub is cooling down.
+When no cooldown is active, the poller keeps the existing live `gh pr view` behavior and refreshes the small cache after a successful read.
+
+`fm-pr-merge.sh` refuses an explicit merge during a known shared cooldown.
+That refusal is a structured escalation naming the provider, account, route, reset time, attempted operation, and required action.
+`fm-teardown.sh` skips GitHub PR lookup proofs during a shared cooldown and falls back to the existing content-in-default proof; if neither proof can establish landed work, teardown still refuses fail-safe.
+`fm-bearings-snapshot.sh --include-prs` reports a bounded deferred PR status during cooldown, while the default bearings path remains local-only.
+
 ## Opposite-Harness Constraint
 
 Adversarial review lanes can add this line to their task meta:
