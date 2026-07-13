@@ -21,23 +21,27 @@ The durable marker and the tmux flash are unchanged; the active alert is added a
 
 - `off` - position-independent kill switch that disables every active alert; the marker and tmux flash remain.
 - `auto` / `default` - platform default. macOS resolves to `osascript`; other platforms have no built-in OS channel, so `auto` there fires nothing and logs that the durable marker is the only signal (configure a `command:` directive instead).
+- `direct-dm` - call the optional authenticated direct-DM helper.
 - `osascript` - a macOS Notification Center banner via `osascript`. OS-level, so it reaches the captain even when every pane and its status-line is unreadable.
 - `herdr` - a herdr UI notification via `herdr notification show`. herdr's own surface, separate from the pane and its status-line.
 - `command:<cmd>` - run `<cmd>` via `sh -c`, with the alarm summary passed as `$1` and on stdin. Lets the alert reach a phone or pager (ntfy, Slack, SMS) even when the captain is away from the machine entirely.
 
-An absent `config/wedge-alarm` behaves as `auto`, i.e. default-on on macOS.
+An absent `config/wedge-alarm` first tries the optional direct-DM helper when `bin/fm-afk-slack-dm.sh` is executable and `config/afk-slack-dm` exists.
+The helper receives the safe summary on argv and stdin, and `FM_AFK_SLACK_DM_CONFIG` points at the config file.
+If the helper is absent or fails, the alarm falls back to `auto`.
+An absent `config/wedge-alarm` otherwise behaves as `auto`, i.e. default-on on macOS.
 Default-on is deliberate: the alarm's entire purpose is that a wedged away-mode primary is never silent, so the reachable OS channel fires unless the captain explicitly disables it.
 The alarm is rate-limited to at most once per max-defer window, and fires only after a genuine wedge past max-defer, so the default-on banner is rare and never chatty.
 
 Each channel is best-effort: a missing binary or a non-zero exit logs a warning and the alarm falls through to the next channel, never crashing the daemon loop.
-Every invocation is also process-group bounded by `FM_WEDGE_ALARM_TIMEOUT_SECS` (10 seconds by default), including `command:`, `osascript`, `herdr`, and an `FM_WEDGE_ALARM_EXEC` override.
+Every invocation is also process-group bounded by `FM_WEDGE_ALARM_TIMEOUT_SECS` (10 seconds by default), including `direct-dm`, `command:`, `osascript`, `herdr`, and an `FM_WEDGE_ALARM_EXEC` override.
 On timeout or daemon shutdown, its watchdog terminates the notifier group, logs the timeout when applicable, and continues to the next configured channel.
 The AppleScript passes the summary as an `argv` item rather than interpolating it into the script source, so summary text can never break the notification.
 See `docs/examples/wedge-alarm` for a copyable starting config.
 
 ## Test safety: no test posts a real notification
 
-Every notifier channel (`osascript`, `herdr`, and `command:`) routes through a single seam, `FM_WEDGE_ALARM_EXEC`: when it is set, the daemon hands the fixed channel category and summary to that command instead of the real notifier (`wedge_alarm_emit` in `bin/fm-supervise-daemon.sh`).
+Every notifier channel (`direct-dm`, `osascript`, `herdr`, and `command:`) routes through a single seam, `FM_WEDGE_ALARM_EXEC`: when it is set, the daemon hands the fixed channel category and summary to that command instead of the real notifier (`wedge_alarm_emit` in `bin/fm-supervise-daemon.sh`).
 This makes it structurally impossible for a test to post a real desktop notification, and impossible for a future test author to forget to stub:
 
 - The daemon is only ever sourced (not executed) by tests - production `bin/fm-afk-start.sh` execs it.

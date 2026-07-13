@@ -1395,6 +1395,40 @@ test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend() {
   pass "inject_wedge_alarm writes the marker AND emits the active alert even with no tmux status-line (herdr backend)"
 }
 
+test_inject_wedge_alarm_direct_dm_falls_back_once_across_restart() {
+  local dir state log helper cfgdir direct_count native_count
+  dir=$(make_wedge_case wedge-direct-dm-restart)
+  state="$dir/state"; log="$dir/alert.log"; helper="$dir/fm-afk-slack-dm.sh"; cfgdir="$dir/config"
+  mkdir -p "$cfgdir"
+  : > "$cfgdir/afk-slack-dm"
+  cat > "$helper" <<'SH'
+#!/usr/bin/env bash
+exit 77
+SH
+  chmod +x "$helper"
+  escalate_add "$state" "needs-decision: pick A"
+
+  WEDGE_ALARM_LAST_EPOCH=0
+  PATH="$dir/fakebin:$PATH" FM_FAKE_UNAME=Darwin FM_CONFIG_OVERRIDE="$cfgdir" \
+    FM_AFK_DIRECT_DM_HELPER="$helper" FM_WEDGE_ALARM_LOG="$log" \
+    FM_WEDGE_ALARM_FAIL=direct-dm FM_SUPERVISOR_BACKEND=herdr \
+    inject_wedge_alarm "$state" 601
+
+  # Simulate a daemon restart: the in-process throttle is gone, so only the
+  # durable wedge marker can prevent a duplicate out-of-band alert.
+  WEDGE_ALARM_LAST_EPOCH=0
+  PATH="$dir/fakebin:$PATH" FM_FAKE_UNAME=Darwin FM_CONFIG_OVERRIDE="$cfgdir" \
+    FM_AFK_DIRECT_DM_HELPER="$helper" FM_WEDGE_ALARM_LOG="$log" \
+    FM_WEDGE_ALARM_FAIL=direct-dm FM_SUPERVISOR_BACKEND=herdr \
+    inject_wedge_alarm "$state" 602
+
+  direct_count=$(awk -F '\t' '$1 == "direct-dm" { n++ } END { print n + 0 }' "$log")
+  native_count=$(awk -F '\t' '$1 == "osascript" { n++ } END { print n + 0 }' "$log")
+  [ "$direct_count" = 1 ] || fail "direct-DM channel fired $direct_count times instead of once: $(cat "$log")"
+  [ "$native_count" = 1 ] || fail "native fallback fired $native_count times instead of once: $(cat "$log")"
+  pass "inject_wedge_alarm falls back from direct-DM to native push once and survives daemon restart"
+}
+
 test_inject_wedge_alarm_throttles_when_marker_cannot_be_written() {
   local dir state log daemon_log alerts errors
   dir=$(make_wedge_case wedge-unwritable-marker)
@@ -1729,6 +1763,7 @@ test_wedge_alarm_backgrounded_command_times_out_and_reaps_descendant
 test_wedge_alarm_hung_override_times_out_and_falls_through
 test_wedge_alarm_shutdown_stops_active_notifier_group
 test_inject_wedge_alarm_fires_active_alert_on_non_tmux_backend
+test_inject_wedge_alarm_direct_dm_falls_back_once_across_restart
 test_inject_wedge_alarm_throttles_when_marker_cannot_be_written
 test_fm_send_exits_nonzero_on_confirmed_swallow
 test_fm_send_exits_nonzero_on_initial_send_failure

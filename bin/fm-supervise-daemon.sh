@@ -103,11 +103,20 @@
 #                                   alarm fires (default 300; 0 disables)
 #          FM_WEDGE_ALARM_CHANNEL   override config/wedge-alarm with a single
 #                                   active-alert directive for that wedge alarm
-#                                   (off|auto|osascript|herdr|command:<cmd>). An
-#                                   absent file/var means auto: on macOS that is
-#                                   an OS-level notification, so the alarm is
-#                                   never silent. See wedge_alarm_notify below
-#                                   and docs/configuration.md.
+#                                   (off|auto|direct-dm|osascript|herdr|command:<cmd>).
+#                                   An absent file/var means the optional
+#                                   direct-DM helper fires first when configured,
+#                                   falling back to auto: on macOS auto is an
+#                                   OS-level notification, so the alarm is never
+#                                   silent. See wedge_alarm_notify below and
+#                                   docs/wedge-alarm.md.
+#          FM_AFK_DIRECT_DM_HELPER  optional direct-DM helper override for the
+#                                   wedge alarm. Defaults to
+#                                   bin/fm-afk-slack-dm.sh when executable and
+#                                   config/afk-slack-dm exists. The helper
+#                                   receives the safe summary on argv[1] and
+#                                   stdin; FM_AFK_SLACK_DM_CONFIG points at its
+#                                   config file.
 #          FM_WEDGE_ALARM_EXEC      notifier seam: when set, every notifier
 #                                   channel routes through this command as
 #                                   `<cmd> <channel> <summary>` instead of
@@ -621,7 +630,8 @@ escalate_flush() {  # <state>
 # surfaces until the next fleet action (that night, 20 escalations sat buffered
 # for 8.5h). These helpers add a configurable active alert that does not depend
 # on any pane or its backend status-line: an OS-level macOS notification, a
-# herdr notification, or a captain-supplied command (push to a phone, etc.).
+# herdr notification, an authenticated direct-DM helper, or a captain-supplied
+# command (push to a phone, etc.).
 # Every channel is best-effort - a missing or failing channel logs and is
 # skipped, never crashing the daemon loop - and the durable marker plus the tmux
 # flash stay exactly as before.
@@ -632,12 +642,14 @@ escalate_flush() {  # <state>
 #   off              disable the active alert entirely, regardless of position
 #                    (marker + flash remain)
 #   auto | default   platform default: macOS -> osascript; otherwise none
+#   direct-dm        optional authenticated direct-DM helper
 #   osascript        macOS Notification Center banner (backend-independent)
 #   herdr            herdr UI notification (herdr notification show)
 #   command:<cmd>    run <cmd> via `sh -c`, summary on $1 and on stdin
-# An absent config means auto, i.e. default-ON on macOS: the alarm's whole
-# purpose is to never be silent, so the reachable OS channel fires unless the
-# captain explicitly disables it.
+# An absent config means direct-DM when configured, otherwise auto. If direct-DM
+# is attempted and fails, auto remains the native fallback. On macOS auto is
+# default-ON: the alarm's whole purpose is to never be silent, so the reachable
+# OS channel fires unless the captain explicitly disables it.
 
 # Print the configured channel directives, one per line. FM_WEDGE_ALARM_CHANNEL
 # wins (a single directive); else each non-empty, non-comment line of
@@ -671,6 +683,21 @@ wedge_alarm_platform_default() {
     Darwin) command -v osascript >/dev/null 2>&1 && printf 'osascript' ;;
     *) : ;;
   esac
+}
+
+wedge_alarm_direct_dm_helper() {
+  printf '%s\n' "${FM_AFK_DIRECT_DM_HELPER:-$FM_ROOT/bin/fm-afk-slack-dm.sh}"
+}
+
+wedge_alarm_direct_dm_config() {
+  printf '%s\n' "${FM_AFK_DIRECT_DM_CONFIG:-${FM_CONFIG_OVERRIDE:-$FM_HOME/config}/afk-slack-dm}"
+}
+
+wedge_alarm_direct_dm_configured() {
+  local helper cfg
+  helper=$(wedge_alarm_direct_dm_helper)
+  cfg=$(wedge_alarm_direct_dm_config)
+  [ -x "$helper" ] && [ -f "$cfg" ]
 }
 
 wedge_alarm_run_bounded() {
@@ -719,8 +746,9 @@ wedge_alarm_stop_active_notifier() {
 
 # The single execution seam for every configured notifier channel.
 # FM_WEDGE_ALARM_EXEC, when set, REPLACES the real notifier: the resolved channel
-# name and summary are handed to that command instead of ever invoking osascript
-# or herdr or a captain-supplied command. This is the one injection point the test harness forces to a recorder
+# name and summary are handed to that command instead of ever invoking direct-DM,
+# osascript, herdr, or a captain-supplied command. This is the one injection
+# point the test harness forces to a recorder
 # so no test can post a real desktop notification - the library-mode guard at the
 # foot of this file defaults it to "discard" whenever the daemon is SOURCED
 # rather than executed, which is the only way a test reaches these functions. The
@@ -779,6 +807,26 @@ wedge_alarm_via_herdr() {  # <summary>
   return 1
 }
 
+wedge_alarm_via_direct_dm() {  # <summary>
+  local summary=$1 rc helper cfg
+  wedge_alarm_os_notifier_override direct-dm "$summary"
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 1 ;;
+  esac
+  helper=$(wedge_alarm_direct_dm_helper)
+  cfg=$(wedge_alarm_direct_dm_config)
+  [ -x "$helper" ] || {
+    log "wedge alarm: direct-DM helper not found; native fallback remains available"; return 1; }
+  [ -f "$cfg" ] || {
+    log "wedge alarm: direct-DM config missing; native fallback remains available"; return 1; }
+  FM_AFK_SLACK_DM_CONFIG="$cfg" \
+    wedge_alarm_run_bounded direct-dm "$helper" "$summary" <<< "$summary" >/dev/null 2>&1 && return 0
+  log "wedge alarm: direct-DM helper failed; native fallback remains available"
+  return 1
+}
+
 # Run a captain-supplied command with the summary on $1 and on stdin, so an
 # alert can reach a phone/pager (ntfy, Slack, SMS) even when the captain is away
 # from the machine entirely. Best-effort: logs and returns 1 on failure.
@@ -810,6 +858,7 @@ wedge_alarm_emit() {  # <channel> <summary>
       return 1 ;;
   esac
   case "$channel" in
+    direct-dm) wedge_alarm_via_direct_dm "$summary" ;;
     osascript) wedge_alarm_via_osascript "$summary" ;;
     herdr) wedge_alarm_via_herdr "$summary" ;;
     command) wedge_alarm_via_command "$cmd" "$summary" ;;
@@ -822,8 +871,15 @@ wedge_alarm_emit() {  # <channel> <summary>
 # `auto` (no OS channel on this platform) logs that the durable marker is the
 # only signal. Every notifier routes through the test-forced recorder seam.
 wedge_alarm_notify() {  # <summary> <marker>
-  local summary=$1 marker=$2 ch
+  local summary=$1 marker=$2 ch cfg
   local -a channels=()
+  cfg="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}/wedge-alarm"
+  if [ -z "${FM_WEDGE_ALARM_CHANNEL:-}" ] && [ ! -f "$cfg" ] && wedge_alarm_direct_dm_configured; then
+    if wedge_alarm_emit direct-dm "$summary"; then
+      return 0
+    fi
+    log "wedge alarm: direct-DM failed; falling back to native alert"
+  fi
   while IFS= read -r ch; do
     [ -n "$ch" ] || continue
     channels+=("$ch")
@@ -835,6 +891,7 @@ wedge_alarm_notify() {  # <summary> <marker>
     case "$ch" in auto|default) ch=$(wedge_alarm_platform_default) ;; esac
     case "$ch" in
       '') log "wedge alarm: no OS-level alert channel on $(uname); durable marker $marker is the only signal - set config/wedge-alarm (e.g. a command: directive)" ;;
+      direct-dm) wedge_alarm_emit direct-dm "$summary" || true ;;
       osascript|herdr) wedge_alarm_emit "$ch" "$summary" || true ;;
       command:*) wedge_alarm_emit command "$summary" "${ch#command:}" || true ;;
       *) log "wedge alarm: unrecognized active-alert channel directive (redacted); marker still written" ;;
