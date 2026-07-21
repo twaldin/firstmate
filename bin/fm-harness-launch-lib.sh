@@ -68,12 +68,12 @@ fm_launch_effort_flag_for_harness() {
       ;;
     grok)
       case "$effort" in
-        low|medium|high|xhigh) printf -- '--reasoning-effort %s ' "$(fm_launch_shell_quote "$effort")" ;;
+        low|medium|high) printf -- '--reasoning-effort %s ' "$(fm_launch_shell_quote "$effort")" ;;
       esac
       ;;
     pi)
       case "$effort" in
-        low|medium|high|xhigh) printf -- '--thinking %s ' "$(fm_launch_shell_quote "$effort")" ;;
+        low|medium|high|xhigh|max) printf -- '--thinking %s ' "$(fm_launch_shell_quote "$effort")" ;;
       esac
       ;;
   esac
