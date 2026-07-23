@@ -157,6 +157,7 @@ chmod +x "$TMUX_SHIM_DIR/tmux"
 
 start_daemon() {
   PATH="$TMUX_SHIM_DIR:$PATH" \
+  FM_SUPERVISE_AWAY_MODE=1 \
   FM_STATE_OVERRIDE="$STATE_DIR" \
   FM_SUPERVISOR_TARGET="$SUPERVISOR_PANE" \
   FM_SUPERVISOR_BACKEND=tmux \
@@ -169,7 +170,7 @@ start_daemon() {
   FM_INJECT_CONFIRM_SLEEP=0.3 \
   FM_INJECT_CONFIRM_RETRIES=5 \
   FM_STALE_ESCALATE_SECS=999999 \
-  nohup "$DAEMON" >"$STATE_DIR/daemon.out" 2>"$STATE_DIR/daemon.err" &
+  nohup "$DAEMON" --away-mode >"$STATE_DIR/daemon.out" 2>"$STATE_DIR/daemon.err" &
   DAEMON_PID=$!
   # Wait for the daemon to start and acquire the lock.
   local i=0

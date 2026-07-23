@@ -269,6 +269,7 @@ start_daemon() {
   [ ! -f "$STATE_DIR/.supervise-daemon.log" ] || log_start=$(wc -l < "$STATE_DIR/.supervise-daemon.log")
   PATH="$HERDR_SHIM_DIR:$PATH" \
   HERDR_SESSION="$SESSION" \
+  FM_SUPERVISE_AWAY_MODE=1 \
   FM_STATE_OVERRIDE="$STATE_DIR" \
   FM_SUPERVISOR_BACKEND=herdr \
   FM_SUPERVISOR_TARGET="$SUPERVISOR_TARGET" \
@@ -281,7 +282,7 @@ start_daemon() {
   FM_INJECT_CONFIRM_SLEEP=0.5 \
   FM_INJECT_CONFIRM_RETRIES=6 \
   FM_STALE_ESCALATE_SECS=999999 \
-  nohup "$DAEMON" >"$STATE_DIR/daemon.out" 2>"$STATE_DIR/daemon.err" &
+  nohup "$DAEMON" --away-mode >"$STATE_DIR/daemon.out" 2>"$STATE_DIR/daemon.err" &
   DAEMON_PID=$!
   wait_daemon_started daemon "$log_start"
 }

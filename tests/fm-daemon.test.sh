@@ -23,6 +23,35 @@ fi
 
 TMP_ROOT=$(fm_test_tmproot fm-daemon-tests)
 
+wait_for_file_contains() {
+  local file=$1 needle=$2 limit=${3:-80} i=0
+  while [ "$i" -lt "$limit" ]; do
+    if [ -f "$file" ] && grep -F -- "$needle" "$file" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+wait_for_file_empty() {
+  local file=$1 limit=${2:-80} i=0
+  while [ "$i" -lt "$limit" ]; do
+    [ ! -s "$file" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+stop_daemon_pid() {
+  local pid=$1
+  [ -n "$pid" ] || return 0
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
 test_afk_start_refuses_when_flag_cannot_be_written() {
   local dir state out status
   dir=$(make_supercase afk-start-flag-unwritable)
@@ -1724,6 +1753,112 @@ test_inject_msg_defers_on_dead_shell_unknown() {
   pass "inject_msg: defers on a dead-shell/unreadable composer (unknown), never typing the escalation into a shell"
 }
 
+test_neutral_host_default_queues_without_away_side_effects() {
+  local dir state fakebin calls status_file out err pid f
+  dir=$(make_supercase neutral-host-main)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  calls="$dir/tmux.calls"
+  status_file="$state/neutral-host.status"
+  out="$dir/daemon.out"
+  err="$dir/daemon.err"
+  : > "$calls"
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_FAKE_TMUX_CALLS:?FM_FAKE_TMUX_CALLS unset}"
+exit 19
+SH
+  chmod +x "$fakebin/tmux"
+  printf 'done: PR https://example.test/pr/neutral\n' > "$status_file"
+
+  PATH="$fakebin:$PATH" \
+    FM_FAKE_TMUX_CALLS="$calls" \
+    FM_STATE_OVERRIDE="$state" \
+    FM_POLL=1 \
+    FM_SIGNAL_GRACE=0 \
+    FM_HEARTBEAT=999999 \
+    FM_CHECK_INTERVAL=999999 \
+    "$DAEMON" >"$out" 2>"$err" &
+  pid=$!
+
+  if ! wait_for_file_contains "$state/.wake-queue" "signal" 80; then
+    stop_daemon_pid "$pid"
+    fail "neutral host did not leave the watcher-fired signal in .wake-queue; stderr=$(cat "$err" 2>/dev/null)"
+  fi
+  stop_daemon_pid "$pid"
+
+  [ ! -e "$state/.afk" ] || fail "neutral host created state/.afk"
+  for f in "$state"/.subsuper-*; do
+    [ ! -e "$f" ] || fail "neutral host wrote away-mode state: $f"
+  done
+  [ ! -s "$calls" ] || fail "neutral host resolved or probed an injection pane: $(cat "$calls")"
+  grep -F "signal" "$state/.wake-queue" >/dev/null || fail "neutral host wake queue missing signal record"
+  grep -F "mode=neutral-host" "$state/.supervise-daemon.log" >/dev/null \
+    || fail "neutral host startup mode was not logged"
+  pass "default neutral host queues watcher wakes without afk, injection target, or .subsuper side effects"
+}
+
+test_away_mode_flag_keeps_daemon_injection_path() {
+  local dir state fakebin sent capture status_file out err pid
+  dir=$(make_supercase away-mode-main)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"
+  capture="$dir/pane.txt"
+  status_file="$state/away-mode.status"
+  out="$dir/daemon.out"
+  err="$dir/daemon.err"
+  : > "$sent"
+  : > "$capture"
+  printf 'done: PR https://example.test/pr/away\n' > "$status_file"
+  afk_enter "$state"
+  date '+%s' > "$state/.subsuper-last-scan"
+
+  PATH="$fakebin:$PATH" \
+    FM_STATE_OVERRIDE="$state" \
+    FM_SUPERVISOR_BACKEND=tmux \
+    FM_SUPERVISOR_TARGET=fakepane \
+    FM_FAKE_TMUX_PANE_ALIVE=1 \
+    FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" \
+    FM_ESCALATE_BATCH_SECS=0 \
+    FM_HEARTBEAT_SCAN_SECS=999999 \
+    FM_HOUSEKEEPING_TICK=1 \
+    FM_INJECT_SKIP=heartbeat \
+    FM_POLL=1 \
+    FM_SIGNAL_GRACE=0 \
+    FM_HEARTBEAT=999999 \
+    FM_CHECK_INTERVAL=999999 \
+    "$DAEMON" --away-mode >"$out" 2>"$err" &
+  pid=$!
+
+  if ! wait_for_file_contains "$sent" "Supervisor escalate" 200; then
+    stop_daemon_pid "$pid"
+    fail "away-mode daemon did not inject an escalation digest; stderr=$(cat "$err" 2>/dev/null); log=$(cat "$state/.supervise-daemon.log" 2>/dev/null); sent=$(cat "$sent" 2>/dev/null)"
+  fi
+  if ! wait_for_file_contains "$sent" "[ENTER]" 200; then
+    stop_daemon_pid "$pid"
+    fail "away-mode daemon typed a digest but did not submit it; sent=$(cat "$sent" 2>/dev/null)"
+  fi
+  if ! wait_for_file_empty "$state/.subsuper-escalations" 100; then
+    stop_daemon_pid "$pid"
+    fail "away-mode daemon did not clear the escalation buffer after submit"
+  fi
+  stop_daemon_pid "$pid"
+
+  grep -F "done: PR https://example.test/pr/away" "$sent" >/dev/null \
+    || fail "away-mode digest did not include the terminal status"
+  local enter_count
+  enter_count=$(grep -c '\[ENTER\]' "$sent" | tr -d ' ')
+  [ "$enter_count" -eq 1 ] \
+    || fail "away-mode digest was not submitted exactly once (count=$enter_count; sent=$(cat "$sent" 2>/dev/null))"
+  grep -F "signal" "$state/.wake-queue" >/dev/null || fail "away-mode watcher did not queue the signal"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "away-mode buffer was not cleared after injection"
+  grep -F "mode=away" "$state/.supervise-daemon.log" >/dev/null \
+    || fail "away-mode startup mode was not logged"
+  pass "explicit --away-mode preserves daemon classify/escalate/inject behavior"
+}
+
 test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
@@ -1821,3 +1956,5 @@ test_inject_msg_herdr_composer_guard_defers
 test_inject_msg_herdr_pane_gone_defers
 test_inject_msg_herdr_submits_through_backend_dispatch
 test_inject_msg_defers_on_dead_shell_unknown
+test_neutral_host_default_queues_without_away_side_effects
+test_away_mode_flag_keeps_daemon_injection_path

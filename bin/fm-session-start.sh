@@ -381,7 +381,8 @@ done
 
 subsection "AFK"
 if [ -e "$STATE/.afk" ]; then
-  printf 'present - away-mode supervision is active; the daemon owns the watcher.\n'
+  AFK_PRESENT=1
+  printf 'present - away-mode supervision is active; the away-mode daemon owns the watcher.\n'
 else
   printf 'absent\n'
 fi
@@ -397,9 +398,9 @@ holding the lock owns mutable follow-up.
 EOF
 elif [ "$AFK_PRESENT" -eq 1 ]; then
   cat <<'EOF'
-Away mode is active. Follow the supervision operating instructions block above:
-load /afk and ensure the daemon is running, because the daemon owns watcher
-supervision.
+Away mode is active. Do not arm the normal watcher directly; load /afk and
+ensure the daemon is running with --away-mode, because the away-mode daemon
+owns watcher supervision.
 
 EOF
 elif [ -f "$CONFIG/x-mode.env" ]; then

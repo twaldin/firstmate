@@ -91,9 +91,12 @@ The caller-facing label remains `fm-<id>`, but the actual cmux workspace title i
 Test cleanup must use the guarded path described in [`docs/cmux-backend.md`](cmux-backend.md)'s "Test safety" section, never enumerate-and-close every workspace.
 The `config/backend` file is not inherited by secondmate homes.
 
-## Away-mode supervisor backend (FM_SUPERVISOR_BACKEND / FM_SUPERVISOR_TARGET)
+## Watcher host and away-mode supervisor backend
 
-The `/afk` sub-supervisor injects escalation digests into firstmate's own pane independently of where new task endpoints are spawned.
+`bin/fm-supervise-daemon.sh` starts in neutral watcher-host mode unless `FM_SUPERVISE_AWAY_MODE=1` or `--away-mode` is set.
+Neutral mode keeps `bin/fm-watch.sh` alive with the daemon's lock, pidfile, crash backoff, and child respawn loop, but it does not resolve a supervisor pane and does not write `state/.subsuper-*`.
+Use it instead of the plain `bin/fm-watch-arm.sh` re-arm loop only when a home deliberately wants the reaper-surviving host; both paths share the same watcher lock and liveness beacon, so `fm-watch-arm.sh` remains an honest verifier.
+The `/afk` sub-supervisor starts the same daemon with the explicit away-mode opt-in and injects escalation digests into firstmate's own pane independently of where new task endpoints are spawned.
 It currently supports only `tmux` and `herdr` supervisor panes.
 Set `FM_SUPERVISOR_BACKEND=tmux|herdr` and `FM_SUPERVISOR_TARGET=<target>` to override both axes explicitly; for herdr the target is `"<session>:<pane-id>"`.
 Without overrides, backend detection uses `$TMUX_PANE` first, then `HERDR_ENV=1` with `HERDR_PANE_ID`, then falls back to `tmux`.
@@ -439,7 +442,8 @@ FM_SEND_RETRIES=3       # fm-send Enter-retry attempts after typing the line onc
 FM_SEND_SLEEP=0.4       # seconds between fm-send submit checks
 FM_SEND_SETTLE=1        # seconds fm-send waits after a successful text submit; 0 disables
 FM_PENDING_REPLY_GRACE_SECS=120   # seconds after marked-request delivery before a completed turn without a correlated parent report is eligible for its one recovery repost
-# sub-supervisor (bin/fm-supervise-daemon.sh); presence-gated via /afk
+# watcher host and away-mode sub-supervisor (bin/fm-supervise-daemon.sh)
+FM_SUPERVISE_AWAY_MODE=0           # 1/true/on/away opts into /afk classification, injection, and housekeeping; unset/0 leaves neutral watcher-host mode
 FM_SUPERVISOR_BACKEND=             # optional supervisor pane backend override; tmux/herdr only, otherwise detects $TMUX_PANE then HERDR_ENV/HERDR_PANE_ID before tmux fallback
 FM_SUPERVISOR_TARGET=              # optional supervisor pane target override; tmux target or herdr <session>:<pane-id>, otherwise auto-detected
 FM_INJECT_SKIP=heartbeat           # |-prefixes force-self-handled bypassing classification; empty disables

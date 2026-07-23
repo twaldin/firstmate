@@ -45,7 +45,9 @@ batched digest rather than per-wake injections.
      launch").
    Both paths share `bin/fm-afk-start.sh` as the daemon entry.
    The native path tells it that the launcher already prepared lifecycle state; the terminal-backed path lets the entry perform its existing state setup inside the new terminal.
-   It exits immediately if the identity-backed daemon lock already names a live process, otherwise it execs `bin/fm-supervise-daemon.sh` in the foreground.
+   It launches `bin/fm-supervise-daemon.sh --away-mode`, the explicit opt-in that turns the neutral watcher host into the away-mode engine.
+   It exits immediately if the identity-backed daemon lock already names a live away-mode process.
+   If a neutral watcher host is running, the launcher replaces it because `state/.afk` alone does not enable away behavior.
    The daemon is **presence-gated**: it injects escalations only while
    `state/.afk` exists, and stays quiet otherwise.
 
@@ -145,12 +147,10 @@ behavior but needs a separate fix; the gap is recorded in
 
 ## Classification policy
 
-The daemon wraps `fm-watch.sh`, runs the watcher as a child, classifies each
-wake reason in bash, and self-handles the routine majority without consuming a
-firstmate turn.
+When launched with `--away-mode`, the daemon wraps `fm-watch.sh`, runs the watcher as a child, classifies each wake reason in bash, and self-handles the routine majority without consuming a firstmate turn.
 Captain-relevant events, plus a bounded recheck of a declared external wait that remains idle, escalate to firstmate's context as one pre-read, single-line, batched digest.
 The classification predicates (the captain-relevant verb set, declared-pause vocabulary, signal/stale tests, and fleet-scan) live in the shared `bin/fm-classify-lib.sh`, the same library the always-on watcher uses for its own triage when afk is off, so the two modes apply one identical policy.
-While `state/.afk` exists the daemon owns the watcher, so the watcher reverts to one-shot and lets the daemon do the triage - the two never run their triage at the same time.
+While the daemon is in away mode and `state/.afk` exists, the watcher reverts to one-shot and lets the daemon do the triage - the two never run their triage at the same time.
 
 Classify each wake this way:
 

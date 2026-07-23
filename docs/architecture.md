@@ -62,16 +62,22 @@ Pi and OpenCode verify session-lock ownership and launch one singleton successor
 Claude keeps its tracked background-task protocol and adds a narrow PreToolUse continuity gate that allows drain, arm recovery, and fail-closed teardown while refusing only other fleet commands when tasks are in flight and no identity-matched live watcher holds the home lock.
 The existing turn-end guard is unchanged and remains the final backstop for all five harness protocols.
 Its `--restart` mode signals only the watcher recorded in the current home's `state/.watch.lock`, so restarting one home cannot kill sibling secondmate watchers.
+For homes that need a reaper-surviving watcher host instead of a one-cycle tracked child, start `bin/fm-supervise-daemon.sh` with no flags.
+That default neutral-host mode keeps respawning one-shot `bin/fm-watch.sh` children under the daemon's lock, pidfile, crash backoff, and log, but it leaves every wake record and suppression marker to the watcher itself.
+While the neutral host is running it supersedes the plain `bin/fm-watch-arm.sh` re-arm loop for watcher liveness in that home; `fm-watch-arm.sh` remains valid and coherent because it verifies the same `state/.watch.lock` and fresh `state/.last-watcher-beat` rather than assuming it launched the watcher.
+Do not run both as competing supervision strategies on purpose.
+If a neutral-hosted watcher fires, consume the durable records with the same `bin/fm-wake-drain.sh` path; the host has no injection pane and does no wake classification of its own.
 A pull-based guard (`bin/fm-guard.sh`) warns through supervision tool output if the primary checkout is tangled, or if tasks are in flight and that watcher stops running or queued wakes are waiting to be drained.
 The drain script calls that guard after emptying the queue, which avoids repeating the queued-wakes warning for records it just consumed while still warning on stale watcher liveness.
 It leads with a prominent bordered tangle banner, while `bin/fm-guard.sh` owns the stale-watcher banner/reminder policy so repeated guarded commands stay noisy without reprinting the full watcher-down banner in the same episode.
 On every verified primary harness, tracked hook integration gives the primary session a push-based backstop: when work is in flight and no identity-matched watcher lock with a fresh beacon is live, direct Stop hooks block and passive turn-end hooks force one bounded follow-up.
 The guard covers the main primary and genuinely marked secondmate homes, exempts child crewmate/scout worktrees, is loop-safe per harness, and is documented in [turnend-guard.md](turnend-guard.md).
 
-A presence-gated sub-supervisor (`bin/fm-supervise-daemon.sh`) extends this for walk-away supervision: the `/afk` skill starts it through the tracked foreground helper `bin/fm-afk-start.sh`, after which the watcher reverts to daemon-managed one-shot mode and the daemon self-handles routine wakes in bash.
+The same daemon becomes the walk-away sub-supervisor only when launched with `--away-mode` or `FM_SUPERVISE_AWAY_MODE=1`.
+The `/afk` skill sets `state/.afk` and starts that opt-in away layer through the tracked foreground helper `bin/fm-afk-start.sh`, after which the watcher reverts to daemon-managed one-shot mode and the daemon self-handles routine wakes in bash.
 The watcher and daemon share `bin/fm-classify-lib.sh` for captain-relevant status verbs, declared-external-wait vocabulary, and status-scan primitives.
 Terminal verbs remain captain-relevant, while a nonterminal progress verb cannot become terminal merely because its prose contains a legacy free-text token such as `merged`; bare legacy free-text lines remain compatible.
-The always-on watcher also uses that library's absorb classification on no-verb signals and first-sighting stale panes before status-log terminality is trusted, while the daemon maintains distinct wedge and declared-pause recheck cadences.
+The always-on watcher also uses that library's absorb classification on no-verb signals and first-sighting stale panes before status-log terminality is trusted, while the daemon maintains distinct away-mode wedge and declared-pause recheck cadences.
 In away mode, seen-status dedupe does not clear possible-wedge aging for nonterminal progress, so housekeeping still re-escalates an unchanged idle pane at the configured bound.
 The daemon escalates captain-relevant events, plus a bounded recheck for a declared pause that remains idle, as one batched, single-line digest using the canonical `away-supervisor` kind from `bin/fm-operational-input.sh` so firstmate can distinguish it structurally from real messages.
 Its supervisor injection path supports tmux and herdr panes, with `FM_SUPERVISOR_BACKEND` and `FM_SUPERVISOR_TARGET` resolved independently from the task-spawn backend.
@@ -264,4 +270,5 @@ Use `/stow` before an intentional reset when the conversation may hold durable k
 ## Development notes
 
 The current watcher reliability work combines always-on bash triage with a durable queue for actionable wakes, a race-proof singleton lock, duplicate self-eviction, drain-time liveness assertion, and a self-verifying tracked-child arm wrapper.
-The presence-gated sub-supervisor (`bin/fm-supervise-daemon.sh`) provides walk-away supervision via the `/afk` skill while reusing the same shared wake classifier as the always-on watcher.
+The default `bin/fm-supervise-daemon.sh` mode is now a neutral watcher host for reaper-surviving child respawn.
+The opt-in away-mode layer of that daemon provides walk-away supervision via the `/afk` skill while reusing the same shared wake classifier as the always-on watcher.

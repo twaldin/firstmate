@@ -1,24 +1,29 @@
 #!/usr/bin/env bash
-# fm-supervise-daemon.sh — presence-gated sub-supervisor (closes #27's P2).
+# fm-supervise-daemon.sh - mode-neutral watcher host, with opt-in away mode.
 #
-# Wraps bin/fm-watch.sh: runs it as a child, classifies each wake reason, and
-# either SELF-HANDLES the routine majority in bash (no firstmate turn) or
-# ESCALATES a batched, distilled digest to the supervisor pane on
-# captain-relevant events plus bounded declared-pause rechecks. This is the
-# token-efficient replacement for the prior always-inject daemon: routine
-# signal/stale/heartbeat wakes cost zero firstmate context; only done/
-# needs-decision/blocked/failed/persistent-wedge/check-output events and a
-# declared-pause recheck reach the LLM, and even then as one pre-read digest per
-# batch window.
+# DEFAULT MODE: neutral watcher host.
+# Runs bin/fm-watch.sh as a child and respawns it whenever a one-shot watcher
+# exits, while preserving the daemon's single-instance lock, pidfile, mode file,
+# crash-loop backoff, liveness beacon continuity through the hosted watcher, and
+# trapped shutdown.
+# Neutral mode does not create state/.afk, does not discover or require a
+# supervisor injection pane, does not classify wakes, does not inject or send
+# Slack DMs, does not run the away-mode housekeeping fleet scan, does not write
+# state/.subsuper-* files, and does not touch state/.wake-queue or .seen-*.
+# The hosted watcher remains the sole owner of durable wake queueing and
+# suppression markers, so the normal fm-wake-drain.sh consumption contract stays
+# unchanged.
 #
-# PRESENCE-GATING (the /afk contract). The daemon is the away-mode engine: it
-# injects ONLY when the durable away-mode flag state/.afk is present. Invoking
-# the /afk skill sets that flag and starts this daemon; any real (unmarked)
-# user message clears it and firstmate resumes full responsiveness.
-# When afk is off, normal fm-watch.sh always-on triage is the active mechanism.
-# Any buffered daemon escalations that remain while afk is off survive in
-# state/.subsuper-escalations and are flushed on the next "while you were out"
-# catch-up or when afk is re-entered.
+# AWAY MODE: explicit opt-in layer.
+# Pass --away-mode, or set FM_SUPERVISE_AWAY_MODE=1, only from an away-mode
+# launcher such as the /afk skill after it has set state/.afk.
+# With that opt-in, this script preserves the historical away-mode behavior:
+# it wraps bin/fm-watch.sh, classifies each one-shot wake reason, self-handles
+# the routine majority in bash, and escalates a batched, distilled digest to the
+# supervisor pane only for captain-relevant events.
+# The existing presence gate still applies inside away mode: injection delivery
+# happens only while state/.afk exists, and buffered daemon escalations survive
+# in state/.subsuper-escalations for catch-up or re-entry.
 #
 # IN-BAND OPERATIONAL INPUT. bin/fm-operational-input.sh constructs every
 # current daemon injection as the typed away-supervisor kind after the stable
@@ -60,46 +65,45 @@
 # backoff, pane-gone guard, and a signal-trapped shutdown that flushes buffered
 # escalations before exit.
 #
-# Usage: fm-supervise-daemon.sh
-#          Long-lived background loop. Normally started by the /afk skill, which
-#          sets state/.afk first. Env knobs:
-#          FM_SUPERVISOR_TARGET     supervisor pane target (override; otherwise
-#                                   auto-discovered per backend - $TMUX_PANE
-#                                   under tmux, "<session>:<pane-id>" from
-#                                   $HERDR_PANE_ID under herdr - then
-#                                   firstmate:0 fallback). Accepts either a
-#                                   tmux target or a herdr "<session>:<pane-id>"
-#                                   target; which one it's read as is decided by
-#                                   FM_SUPERVISOR_BACKEND (below), independently.
-#          FM_SUPERVISOR_BACKEND    supervisor pane BACKEND (tmux|herdr;
-#                                   override; otherwise auto-discovered the same
-#                                   way bin/fm-backend.sh's fm_backend_detect
-#                                   resolves the runtime firstmate itself is
-#                                   executing inside - $TMUX_PANE selects tmux,
-#                                   $HERDR_ENV=1 selects herdr - falling back to
-#                                   tmux). zellij, orca, and cmux are not yet
-#                                   supported as supervisor backends; the daemon
-#                                   refuses loudly at startup rather than trying
-#                                   tmux primitives against a non-tmux pane.
+# Usage:
+#          fm-supervise-daemon.sh
+#              Neutral watcher-host mode, the default.
+#          fm-supervise-daemon.sh --away-mode
+#              Enable the away-mode classifier, batching, injection, stale
+#              backstop, max-defer alarm, and state/.subsuper-* buffering.
+#          FM_SUPERVISE_AWAY_MODE=1 fm-supervise-daemon.sh
+#              Environment equivalent used by launchers that cannot pass flags.
+#          fm-supervise-daemon.sh --neutral-host
+#              Explicitly force the default neutral host, overriding
+#              FM_SUPERVISE_AWAY_MODE.
+#          fm-supervise-daemon.sh --help
+#              Print current flags and environment knobs.
+#
+# Env knobs common to both modes:
+#          FM_SUPERVISE_AWAY_MODE   1/true/yes/on/away enables away mode.
+#                                   0/false/no/off/neutral leaves the neutral
+#                                   host mode active.
+#          FM_LOG_MAX_BYTES / FM_LOG_KEEP_LINES / FM_CRASH_*  log + crash guards.
+#          FM_STATE_OVERRIDE        alternate state dir (testing).
+#
+# Env knobs read only in --away-mode:
+#          FM_SUPERVISOR_TARGET     supervisor pane target override.
+#          FM_SUPERVISOR_BACKEND    supervisor pane backend override (tmux|herdr).
 #          FM_INJECT_SKIP           |-prefixes force-self-handle bypassing
-#                                   classification (default "heartbeat"); empty
-#                                   disables. Use sparingly: it overrides the
-#                                   captain-relevant escalation for matching
-#                                   kinds.
+#                                   classification (default "heartbeat").
 #          FM_STALE_ESCALATE_SECS   idle seconds before a stale pane escalates
 #                                   as a possible wedge (default 240)
 #          FM_PAUSE_RESURFACE_SECS  idle seconds before a declared external wait
 #                                   re-surfaces as a recheck (default 3600)
 #          FM_ESCALATE_BATCH_SECS   buffer window for batched escalation
-#                                   digests; 0 = flush immediately (default 90)
+#                                   digests; 0 = flush immediately (default 90).
 #          FM_HEARTBEAT_SCAN_SECS   cadence for the catch-all status scan
-#                                   (default 300)
-#          FM_HOUSEKEEPING_TICK     seconds between housekeeping passes while
-#                                   the watcher is mid-cycle (default 15)
-#          FM_BUSY_REGEX            OR-ed busy signatures (mirrors fm-watch.sh)
+#                                   (default 300).
+#          FM_HOUSEKEEPING_TICK     seconds between away-mode housekeeping
+#                                   passes (default 15).
+#          FM_BUSY_REGEX            OR-ed busy signatures (mirrors fm-watch.sh).
 #          FM_COMPOSER_IDLE_RE      empty-composer regex applied after dim-ghost
-#                                   and structural border stripping (default:
-#                                   bare prompt glyphs plus busy footers)
+#                                   and structural border stripping.
 #          FM_MAX_DEFER_SECS        max seconds a buffered escalation may sit
 #                                   undelivered before one normal flush attempt;
 #                                   if that cannot confirm a submit, a wedge
@@ -124,22 +128,19 @@
 #                                   next channel (default 10; invalid/zero uses the
 #                                   default).
 #          FM_INJECT_CONFIRM_RETRIES Enter-retry attempts on a swallowed Enter
-#                                   (default 3); the digest is typed once, only
-#                                   Enter is retried. Composer-empty detection is
-#                                   structural and style-aware (bin/fm-tmux-lib.sh):
-#                                   it drops dim/faint ghost text and strips the
-#                                   harness's box borders before deciding, so a
-#                                   ghost-only or bordered-but-empty composer is
-#                                   not misread as pending input.
+#                                   (default 3).
 #          FM_INJECT_CONFIRM_SLEEP  seconds between daemon submit checks
-#                                   (default 0.5)
-#          FM_LOG_MAX_BYTES / FM_LOG_KEEP_LINES / FM_CRASH_*  log + crash guards
-#          FM_STATE_OVERRIDE        alternate state dir (testing)
-#          Logs each wake to state/.supervise-daemon.log (size-capped). Single
-#          instance via portable lock on state/.supervise-daemon.lock. Trapped
-#          SIGTERM/SIGINT shut down within ~1s, flush escalations, release the
-#          lock. A crashing fm-watch.sh is logged and restarted, never killing
-#          the daemon; a tight crash-restart spin is detected and backed off.
+#                                   (default 0.5).
+#          FM_INJECT_FAIL_SLEEP     seconds to back off while the supervisor
+#                                   target is unavailable (default 30).
+#
+# Logs each wake to state/.supervise-daemon.log (size-capped). Single instance
+# via portable lock on state/.supervise-daemon.lock. The current mode is written
+# to state/.supervise-daemon.mode while the process is alive so /afk can replace
+# a neutral host with an away-mode daemon. Trapped SIGTERM/SIGINT shut down
+# within ~1s, release the lock, and flush buffered escalations only in away
+# mode. A crashing fm-watch.sh is logged and restarted, never killing the daemon;
+# a tight crash-restart spin is detected and backed off.
 set -u
 
 FM_DAEMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -1275,7 +1276,78 @@ trim_log() {
 # classifiers above are sourceable for unit tests (tests/fm-daemon.test.sh).
 # ============================================================================
 
+fm_super_usage() {
+  cat <<'EOF'
+Usage:
+  bin/fm-supervise-daemon.sh [--neutral-host]
+  bin/fm-supervise-daemon.sh --away-mode
+
+Modes:
+  --neutral-host
+      Default. Host bin/fm-watch.sh with the daemon's lock, pidfile, crash
+      backoff, and child respawn loop only. No supervisor pane is discovered,
+      no away-mode state is written, no wake is classified, no injection is
+      attempted, and no state/.subsuper-* files are touched.
+
+  --away-mode
+      Opt into the /afk sub-supervisor layer. The daemon discovers the
+      supervisor pane, classifies watcher wake reasons, buffers/escalates
+      captain-relevant events, runs the housekeeping stale/status backstop,
+      and injects only while state/.afk exists.
+
+Environment:
+  FM_SUPERVISE_AWAY_MODE=1
+      Equivalent to --away-mode. Accepted true values: 1, true, yes, on, away.
+      Accepted false values: 0, false, no, off, neutral, or unset.
+
+  FM_STATE_OVERRIDE
+      Alternate state directory for tests.
+
+Away-mode-only environment:
+  FM_SUPERVISOR_BACKEND=tmux|herdr
+  FM_SUPERVISOR_TARGET=<tmux-target-or-herdr-session:pane-id>
+  FM_INJECT_SKIP=heartbeat
+  FM_ESCALATE_BATCH_SECS=90
+  FM_HEARTBEAT_SCAN_SECS=300
+  FM_HOUSEKEEPING_TICK=15
+  FM_STALE_ESCALATE_SECS=240
+  FM_MAX_DEFER_SECS=300
+  FM_INJECT_CONFIRM_RETRIES=3
+  FM_INJECT_CONFIRM_SLEEP=0.5
+  FM_INJECT_FAIL_SLEEP=30
+EOF
+}
+
 fm_super_main() {
+  local MODE arg
+  MODE=neutral
+  case "${FM_SUPERVISE_AWAY_MODE:-}" in
+    1|true|TRUE|yes|YES|on|ON|away|AWAY) MODE=away ;;
+    ''|0|false|FALSE|no|NO|off|OFF|neutral|NEUTRAL) MODE=neutral ;;
+    *)
+      echo "error: invalid FM_SUPERVISE_AWAY_MODE='${FM_SUPERVISE_AWAY_MODE:-}' (use 1/true/on/away or 0/false/off/neutral)" >&2
+      return 2 ;;
+  esac
+  while [ "$#" -gt 0 ]; do
+    arg=$1
+    case "$arg" in
+      --away-mode|--afk)
+        MODE=away
+        FM_SUPERVISE_AWAY_MODE=1 ;;
+      --neutral-host|--host-only)
+        MODE=neutral
+        FM_SUPERVISE_AWAY_MODE=0 ;;
+      -h|--help)
+        fm_super_usage
+        return 0 ;;
+      *)
+        echo "error: unknown argument: $arg" >&2
+        fm_super_usage >&2
+        return 2 ;;
+    esac
+    shift
+  done
+
   local STATE
   STATE="$(_state_root)"
   mkdir -p "$STATE"
@@ -1290,11 +1362,15 @@ fm_super_main() {
   local WATCH_ERR="$STATE/.supervise-daemon.watcher.err"
   local LOCK="$STATE/.supervise-daemon.lock"
   local PIDFILE="$STATE/.supervise-daemon.pid"
+  local MODEFILE="$STATE/.supervise-daemon.mode"
+  local AWAY_MODE=0
   local INJECT_FAIL_SLEEP=${FM_INJECT_FAIL_SLEEP:-$INJECT_FAIL_SLEEP_DEFAULT}
   local CRASH_THRESHOLD=${FM_CRASH_THRESHOLD:-$CRASH_THRESHOLD_DEFAULT}
   local CRASH_WINDOW=${FM_CRASH_WINDOW:-$CRASH_WINDOW_DEFAULT}
   local CRASH_BACKOFF=${FM_CRASH_BACKOFF:-$CRASH_BACKOFF_DEFAULT}
   local CRASH_NORMAL_SLEEP=${FM_CRASH_NORMAL_SLEEP:-$CRASH_NORMAL_SLEEP_DEFAULT}
+  local BACKEND="" TARGET="" backend_source="" target_source=""
+  [ "$MODE" = away ] && AWAY_MODE=1
 
   [ -x "$WATCH" ] || { echo "error: watcher not found or not executable: $WATCH" >&2; exit 1; }
 
@@ -1309,92 +1385,87 @@ fm_super_main() {
   fi
   echo "$$" > "$PIDFILE"
   fm_pid_identity "${BASHPID:-$$}" > "$LOCK/pid-identity" 2>/dev/null || true
+  printf '%s\n' "$MODE" > "$MODEFILE"
 
-  # --- auto-discover the supervisor BACKEND (tmux vs herdr) first -----------
-  # Priority: FM_SUPERVISOR_BACKEND override > $TMUX_PANE (tmux) > $HERDR_ENV=1
-  # (herdr) > tmux fallback. Resolved before the target below, since target
-  # discovery composes a herdr "<session>:<pane-id>" string using the same
-  # $HERDR_PANE_ID/$HERDR_SESSION markers this checks. Exporting the result
-  # into FM_SUPERVISOR_BACKEND makes inject_msg/pane_is_busy/pane_input_pending
-  # (which read that env var) dispatch through the right backend without an
-  # extra global thread-through.
-  local discovered_backend backend_source
-  backend_source="FM_SUPERVISOR_BACKEND"
-  if [ -z "${FM_SUPERVISOR_BACKEND:-}" ]; then
-    if [ -n "${TMUX_PANE:-}" ]; then
-      backend_source="TMUX_PANE"
-    elif [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
-      backend_source="HERDR_ENV"
+  if [ "$AWAY_MODE" -eq 1 ]; then
+    # --- auto-discover the supervisor BACKEND (tmux vs herdr) first ---------
+    # Priority: FM_SUPERVISOR_BACKEND override > $TMUX_PANE (tmux) >
+    # $HERDR_ENV=1 (herdr) > tmux fallback. Neutral host mode never runs this:
+    # resolving an injection backend is away-mode behavior.
+    local discovered_backend
+    backend_source="FM_SUPERVISOR_BACKEND"
+    if [ -z "${FM_SUPERVISOR_BACKEND:-}" ]; then
+      if [ -n "${TMUX_PANE:-}" ]; then
+        backend_source="TMUX_PANE"
+      elif [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+        backend_source="HERDR_ENV"
+      else
+        backend_source="FALLBACK($FM_SUPERVISOR_BACKEND_DEFAULT)"
+      fi
+    fi
+    discovered_backend=$(discover_supervisor_backend) || true
+    FM_SUPERVISOR_BACKEND="$discovered_backend"
+    BACKEND="$FM_SUPERVISOR_BACKEND"
+
+    # --- refuse an unsupported supervisor backend loudly, before ever trying a
+    # tmux/herdr-specific call against it.
+    if ! fm_backend_list_contains "$FM_SUPERVISOR_SUPPORTED_BACKENDS" "$BACKEND"; then
+      echo "error: away-mode daemon does not support supervisor backend '$BACKEND' yet (supported: $FM_SUPERVISOR_SUPPORTED_BACKENDS); set FM_SUPERVISOR_BACKEND=tmux|herdr and FM_SUPERVISOR_TARGET to run firstmate's own pane under a supported backend" >&2
+      log "startup failed: unsupported supervisor backend '$BACKEND' (source=$backend_source)"
+      fm_lock_release "$LOCK" 2>/dev/null || true
+      rm -f "$PIDFILE" 2>/dev/null || true
+      rm -f "$MODEFILE" 2>/dev/null || true
+      exit 1
+    fi
+
+    # --- auto-discover the supervisor target (the pane running firstmate) ---
+    local discovered
+    target_source="FM_SUPERVISOR_TARGET"
+    if [ -z "${FM_SUPERVISOR_TARGET:-}" ]; then
+      if [ -n "${TMUX_PANE:-}" ]; then
+        target_source="TMUX_PANE"
+      elif [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
+        target_source="HERDR_ENV(HERDR_PANE_ID)"
+      else
+        target_source="FALLBACK(firstmate:0)"
+      fi
+    fi
+    if discovered=$(discover_supervisor_target); then
+      : # resolved cleanly
     else
-      backend_source="FALLBACK($FM_SUPERVISOR_BACKEND_DEFAULT)"
+      echo "warn: could not auto-discover supervisor pane (no FM_SUPERVISOR_TARGET, TMUX_PANE, or HERDR_ENV/HERDR_PANE_ID); falling back to '$discovered' - verify this is firstmate's pane" >&2
+    fi
+    FM_SUPERVISOR_TARGET="$discovered"
+    TARGET="$FM_SUPERVISOR_TARGET"
+
+    # --- validate supervisor target at startup (a missing target is a typo) -
+    if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
+      echo "error: supervisor target '$TARGET' does not resolve to a $BACKEND pane; set FM_SUPERVISOR_TARGET" >&2
+      log "startup failed: target '$TARGET' not found (backend=$BACKEND)"
+      fm_lock_release "$LOCK" 2>/dev/null || true
+      rm -f "$PIDFILE" 2>/dev/null || true
+      rm -f "$MODEFILE" 2>/dev/null || true
+      exit 1
     fi
   fi
-  discovered_backend=$(discover_supervisor_backend) || true
-  FM_SUPERVISOR_BACKEND="$discovered_backend"
-  local BACKEND="$FM_SUPERVISOR_BACKEND"
 
-  # --- refuse an unsupported supervisor backend loudly, before ever trying a
-  # tmux/herdr-specific call against it (zellij, orca, and cmux have no verified
-  # composer/busy primitives wired up for this daemon yet - AGENTS.md section 4
-  # harness-verification discipline). This is the clear refusal the task calls
-  # for, instead of a confusing "does not resolve to a tmux pane" error.
-  if ! fm_backend_list_contains "$FM_SUPERVISOR_SUPPORTED_BACKENDS" "$BACKEND"; then
-    echo "error: away-mode daemon does not support supervisor backend '$BACKEND' yet (supported: $FM_SUPERVISOR_SUPPORTED_BACKENDS); set FM_SUPERVISOR_BACKEND=tmux|herdr and FM_SUPERVISOR_TARGET to run firstmate's own pane under a supported backend" >&2
-    log "startup failed: unsupported supervisor backend '$BACKEND' (source=$backend_source)"
-    fm_lock_release "$LOCK" 2>/dev/null || true
-    rm -f "$PIDFILE" 2>/dev/null || true
-    exit 1
-  fi
-
-  # --- auto-discover the supervisor target (the pane running firstmate) -----
-  # Priority: FM_SUPERVISOR_TARGET override > $TMUX_PANE (tmux; inherited from
-  # the pane that launched the daemon, normally firstmate's own) >
-  # $HERDR_PANE_ID (herdr, composed into "<session>:<pane-id>") > firstmate:0
-  # fallback. Exporting the result into FM_SUPERVISOR_TARGET makes inject_msg
-  # (which reads that env var) use the discovered pane without an extra global.
-  local discovered target_source
-  target_source="FM_SUPERVISOR_TARGET"
-  if [ -z "${FM_SUPERVISOR_TARGET:-}" ]; then
-    if [ -n "${TMUX_PANE:-}" ]; then
-      target_source="TMUX_PANE"
-    elif [ "${HERDR_ENV:-}" = "1" ] && [ -n "${HERDR_PANE_ID:-}" ]; then
-      target_source="HERDR_ENV(HERDR_PANE_ID)"
-    else
-      target_source="FALLBACK(firstmate:0)"
-    fi
-  fi
-  if discovered=$(discover_supervisor_target); then
-    : # resolved cleanly
+  if [ "$AWAY_MODE" -eq 1 ]; then
+    local afk_status="off"
+    afk_active "$STATE" && afk_status="on"
+    log "daemon starting (pid $$); mode=away; target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
+    migrate_watcher_pause_markers "$STATE"
   else
-    echo "warn: could not auto-discover supervisor pane (no FM_SUPERVISOR_TARGET, TMUX_PANE, or HERDR_ENV/HERDR_PANE_ID); falling back to '$discovered' — verify this is firstmate's pane" >&2
+    log "daemon starting (pid $$); mode=neutral-host; watcher=$WATCH; away_behavior=off"
   fi
-  FM_SUPERVISOR_TARGET="$discovered"
-  local TARGET="$FM_SUPERVISOR_TARGET"
-
-  # --- validate supervisor target at startup (a missing target is a typo) ---
-  # Dispatches through bin/fm-backend.sh instead of a raw `tmux display-message`
-  # probe, so a herdr supervisor pane is checked via the herdr adapter; for
-  # backend=tmux this runs the exact same `tmux display-message -p -t "$TARGET"
-  # '#{pane_id}'` call as before.
-  if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
-    echo "error: supervisor target '$TARGET' does not resolve to a $BACKEND pane; set FM_SUPERVISOR_TARGET" >&2
-    log "startup failed: target '$TARGET' not found (backend=$BACKEND)"
-    fm_lock_release "$LOCK" 2>/dev/null || true
-    rm -f "$PIDFILE" 2>/dev/null || true
-    exit 1
-  fi
-
-  local afk_status="off"
-  afk_active "$STATE" && afk_status="on"
-  log "daemon starting (pid $$); target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
-  migrate_watcher_pause_markers "$STATE"
 
   # --- shutdown: flush buffered escalations, reap child, release lock -------
   local WATCHER_PID="" CUR_TMP=""
   cleanup() {
     trap - TERM INT
-    wedge_alarm_stop_active_notifier
-    escalate_flush "$STATE" 2>/dev/null || true
+    if [ "$AWAY_MODE" -eq 1 ]; then
+      wedge_alarm_stop_active_notifier
+      escalate_flush "$STATE" 2>/dev/null || true
+    fi
     if [ -n "${WATCHER_PID:-}" ]; then
       kill "$WATCHER_PID" 2>/dev/null || true
       wait "$WATCHER_PID" 2>/dev/null || true
@@ -1404,6 +1475,7 @@ fm_super_main() {
     fi
     fm_lock_release "$LOCK" 2>/dev/null || true
     rm -f "$PIDFILE" 2>/dev/null || true
+    rm -f "$MODEFILE" 2>/dev/null || true
     log "daemon shutting down"
     exit 0
   }
@@ -1444,7 +1516,7 @@ fm_super_main() {
     # has nowhere to go, and firstmate itself is the consumer of escalations.
     # Catch-up signals persist in state/*.status and flow on the next run, so
     # this delays rather than loses work.
-    if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
+    if [ "$AWAY_MODE" -eq 1 ] && ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
       log "warn: supervisor target '$TARGET' gone; backing off ${INJECT_FAIL_SLEEP}s, will retry"
       # Flush is pointless with no pane; preserve any buffered escalations.
       sleep "$INJECT_FAIL_SLEEP"
@@ -1482,7 +1554,11 @@ fm_super_main() {
           continue
         fi
         log "wake: $reason"
-        handle_wake "$reason" "$STATE"
+        if [ "$AWAY_MODE" -eq 1 ]; then
+          handle_wake "$reason" "$STATE"
+        else
+          log "neutral-host observed watcher wake already queued by watcher: $reason"
+        fi
         trim_log
       fi
       start_watcher || continue
@@ -1494,7 +1570,7 @@ fm_super_main() {
     # enough that batch flushes, stale rechecks, and the catch-all scan fire on
     # cadence. Gating keeps a large fleet cheap between ticks.
     sleep 1
-    if [ "$(_file_age "$STATE/.subsuper-last-housekeep")" -ge "${FM_HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}" ]; then
+    if [ "$AWAY_MODE" -eq 1 ] && [ "$(_file_age "$STATE/.subsuper-last-housekeep")" -ge "${FM_HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}" ]; then
       _now > "$STATE/.subsuper-last-housekeep"
       housekeeping "$STATE"
     fi
