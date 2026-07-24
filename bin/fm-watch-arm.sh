@@ -250,18 +250,23 @@ daemon_hosted_watcher_mode() {
 }
 
 report_daemon_hosted() {
-  daemon_hosted_watcher_mode || return 1
-  case "$DAEMON_HOST_MODE" in
+  local mode=$DAEMON_HOST_MODE pid=$DAEMON_HOST_PID
+  if [ -z "$mode" ] || [ -z "$pid" ]; then
+    daemon_hosted_watcher_mode || return 1
+    mode=$DAEMON_HOST_MODE
+    pid=$DAEMON_HOST_PID
+  fi
+  case "$mode" in
     away)
       if fm_away_daemon_owns_catchup "$STATE"; then
-        echo "watcher: hosted-by-daemon pid=$DAEMON_HOST_PID mode=away - /afk daemon owns wake delivery"
+        echo "watcher: hosted-by-daemon pid=$pid mode=away - /afk daemon owns wake delivery"
         return 0
       fi
-      echo "watcher: hosted-by-daemon pid=$DAEMON_HOST_PID mode=away - no harness wake delivery; stop daemon before arming a tracked cycle"
+      echo "watcher: hosted-by-daemon pid=$pid mode=away - no harness wake delivery; stop daemon before arming a tracked cycle"
       return 1
       ;;
     *)
-      echo "watcher: hosted-by-daemon pid=$DAEMON_HOST_PID mode=$DAEMON_HOST_MODE - no harness wake delivery; stop daemon before arming a tracked cycle"
+      echo "watcher: hosted-by-daemon pid=$pid mode=$mode - no harness wake delivery; stop daemon before arming a tracked cycle"
       return 1
       ;;
   esac
@@ -372,7 +377,11 @@ case "${1:-}" in
 esac
 
 if [ "$mode" = restart ]; then
-  if daemon_hosted_watcher_mode || fm_away_daemon_owns_catchup "$STATE"; then
+  if daemon_hosted_watcher_mode; then
+    report_daemon_hosted || true
+    exit 1
+  fi
+  if fm_away_daemon_owns_catchup "$STATE"; then
     report_failed
     exit $?
   fi
@@ -408,6 +417,7 @@ if [ "$mode" = arm ] && healthy_watcher; then
   cycle_begin "$HEALTHY_PID" attached
   report_attached
   attach_and_wait "$HEALTHY_PID"
+  exit $?
 fi
 if [ "$mode" = arm ] && fm_away_daemon_owns_catchup "$STATE"; then
   report_failed
@@ -525,8 +535,14 @@ while :; do
     if daemon_hosted_watcher_mode; then
       report_daemon_hosted
       report_status=$?
-      wait "$child" 2>/dev/null || true
+      cycle_log_append unknown unknown daemon-hosted "hosted:$DAEMON_HOST_PID"
+      if [ -n "$child" ] && fm_pid_alive "$child"; then
+        kill -TERM "$child" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+      fi
       rm -f "$child_out" 2>/dev/null || true
+      child=
+      child_out=
       exit "$report_status"
     fi
     # Another watcher won the singleton; our child stood down.

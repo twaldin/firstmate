@@ -103,8 +103,18 @@ fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 
 fm_supervision_status "$STATE" "$GRACE"
 QUEUE_REASON='queued wakes pending - drain with bin/fm-wake-drain.sh before ending the turn when this session holds the fleet lock; read-only sessions must leave queued wakes for the lock holder'
-WATCH_REASON='tasks in flight, no live watcher - run bin/fm-watch-arm.sh as a background task before ending the turn'
+WATCH_REASON_BASE='tasks in flight, no live watcher - run bin/fm-watch-arm.sh as a background task before ending the turn'
 AWAY_REASON='away-mode daemon is live but watcher liveness is stale - inspect state/.supervise-daemon.log and restart away mode; stop the daemon or exit /afk before falling back to bin/fm-watch-arm.sh'
+
+plain_watch_reason() {
+  local afk=0 x_mode=0 repair
+  [ -e "$STATE/.afk" ] && afk=1
+  [ -f "$CONFIG/x-mode.env" ] && x_mode=1
+  repair=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
+    || printf '%s\n' 'repair missing watcher supervision according to the session-start operating block')
+  printf '%s - %s\n' "$WATCH_REASON_BASE" "$repair"
+}
+
 QUEUE_BLOCK=false
 WATCH_BLOCK=false
 AWAY_DAEMON_ACTIVE=false
@@ -154,7 +164,7 @@ if [ "$QUEUE_BLOCK" = true ] || [ "$WATCH_BLOCK" != false ]; then
     fi
     if [ "$WATCH_BLOCK" = true ]; then
       printf '●  %s task(s) in flight, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_IN_FLIGHT" "$FM_SUP_BEACON_DESC"
-      printf '●  %s\n' "$WATCH_REASON"
+      printf '●  %s\n' "$(plain_watch_reason)"
     elif [ "$WATCH_BLOCK" = away ]; then
       printf '●  %s\n' "$AWAY_REASON"
     elif [ "$WATCH_BLOCK" = daemon ]; then

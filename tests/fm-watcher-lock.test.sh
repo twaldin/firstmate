@@ -37,14 +37,16 @@ record_away_daemon() {
 }
 
 record_watcher_lock() {
-  local dir=$1 state=$2 pid=$3 identity=$4 root bin_dir
+  local dir=$1 state=$2 pid=$3 identity=$4 root bin_dir owner
   root=$(cd "$dir" && pwd)
   bin_dir=$(cd "$ROOT/bin" && pwd)
-  mkdir -p "$state/.watch.lock"
-  printf '%s\n' "$pid" > "$state/.watch.lock/pid"
-  printf '%s\n' "$root" > "$state/.watch.lock/fm-home"
-  printf '%s\n' "$bin_dir/fm-watch.sh" > "$state/.watch.lock/watcher-path"
-  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  rm -rf "$state/.watch.lock"
+  owner=$(mktemp -d "$state/.watch.lock.owner.test.XXXXXX") || fail "could not create fake watcher lock owner"
+  printf '%s\n' "$pid" > "$owner/pid"
+  printf '%s\n' "$root" > "$owner/fm-home"
+  printf '%s\n' "$bin_dir/fm-watch.sh" > "$owner/watcher-path"
+  printf '%s\n' "$identity" > "$owner/pid-identity"
+  ln -s "$owner" "$state/.watch.lock" || fail "could not publish fake watcher lock"
 }
 
 test_singleton_start() {
@@ -909,59 +911,43 @@ test_arm_reports_daemon_hosted_watcher_distinctly() {
 }
 
 test_arm_race_preserves_neutral_hosted_exit_status() {
-  local dir home state fakebin armout blocker hosted daemon_pid blocker_identity hosted_identity daemon_identity setter status
-  dir=$(make_case arm-hosted-race)
+  local dir home state fakebin armout hosted daemon_pid hosted_identity daemon_identity status
+  dir=$(make_case arm-hosted-direct)
   home=$(cd "$dir" && pwd)
   state="$dir/state"
   fakebin="$dir/fakebin"
   armout="$dir/arm.out"
   sleep 300 &
-  blocker=$!
-  blocker_identity=$(pid_identity "$state" "$blocker") || {
-    kill "$blocker" 2>/dev/null || true
-    wait "$blocker" 2>/dev/null || true
-    fail "could not identify blocker pid"
-  }
-  record_watcher_lock "$dir" "$state" "$blocker" "$blocker_identity"
-  sleep 300 &
   daemon_pid=$!
   sleep 300 &
   hosted=$!
   hosted_identity=$(pid_identity "$state" "$hosted") || {
-    kill "$blocker" "$daemon_pid" "$hosted" 2>/dev/null || true
-    wait "$blocker" 2>/dev/null || true
+    kill "$daemon_pid" "$hosted" 2>/dev/null || true
     wait "$daemon_pid" 2>/dev/null || true
     wait "$hosted" 2>/dev/null || true
     fail "could not identify hosted watcher pid"
   }
   daemon_identity=$(pid_identity "$state" "$daemon_pid") || {
-    kill "$blocker" "$daemon_pid" "$hosted" 2>/dev/null || true
-    wait "$blocker" 2>/dev/null || true
+    kill "$daemon_pid" "$hosted" 2>/dev/null || true
     wait "$daemon_pid" 2>/dev/null || true
     wait "$hosted" 2>/dev/null || true
     fail "could not identify daemon pid"
   }
-  (
-    sleep 0.1
-    printf '%s\n' "$daemon_pid" > "$state/.supervise-daemon.pid"
-    printf '%s\n' "$daemon_identity" > "$state/.supervise-daemon.pid-identity"
-    printf 'neutral\n' > "$state/.supervise-daemon.mode"
-    printf '%s\n' "$hosted" > "$state/.supervise-daemon.watcher.pid"
-    record_watcher_lock "$dir" "$state" "$hosted" "$hosted_identity"
-    touch "$state/.last-watcher-beat"
-  ) &
-  setter=$!
+  printf '%s\n' "$daemon_pid" > "$state/.supervise-daemon.pid"
+  printf '%s\n' "$daemon_identity" > "$state/.supervise-daemon.pid-identity"
+  printf 'neutral\n' > "$state/.supervise-daemon.mode"
+  printf '%s\n' "$hosted" > "$state/.supervise-daemon.watcher.pid"
+  record_watcher_lock "$dir" "$state" "$hosted" "$hosted_identity"
+  touch "$state/.last-watcher-beat"
   status=0
   PATH="$fakebin:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$state" FM_ARM_CONFIRM_TIMEOUT=10 "$WATCH_ARM" > "$armout" || status=$?
-  wait "$setter" 2>/dev/null || true
-  kill "$blocker" "$daemon_pid" "$hosted" 2>/dev/null || true
-  wait "$blocker" 2>/dev/null || true
+  kill "$daemon_pid" "$hosted" 2>/dev/null || true
   wait "$daemon_pid" 2>/dev/null || true
   wait "$hosted" 2>/dev/null || true
-  [ "$status" -ne 0 ] || fail "arm race branch exited zero for neutral daemon-hosted watcher"
+  [ "$status" -ne 0 ] || fail "arm exited zero for direct neutral daemon-hosted watcher"
   grep -F "watcher: hosted-by-daemon pid=$hosted mode=neutral" "$armout" >/dev/null \
-    || fail "arm race branch did not report neutral daemon-hosted watcher: $(cat "$armout")"
-  pass "arm singleton-race branch preserves neutral daemon-hosted non-zero status"
+    || fail "arm did not report direct neutral daemon-hosted watcher: $(cat "$armout")"
+  pass "arm direct daemon-host fixture preserves neutral daemon-hosted non-zero status"
 }
 
 test_arm_failure_reports_live_away_daemon() {

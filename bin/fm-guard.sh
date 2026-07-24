@@ -195,18 +195,27 @@ if [ "$watcher_fresh" = false ] || [ "$daemon_delivery_gap" = true ]; then
       print_full_banner=1
     fi
   fi
-  if [ "$READ_ONLY" -eq 1 ]; then
-    fix='Watcher repair belongs to the session holding the fleet lock; do not drain or re-arm from this read-only session.'
-  elif [ "$daemon_delivery_gap" = true ]; then
-    fix='Stop the watcher host, or re-enter /afk if away mode should own delivery, then run bin/fm-watch-arm.sh as the harness-tracked background task (never a shell & that gets reaped).'
-  elif [ "$away_daemon_active" = true ]; then
-    fix='Away-mode daemon is live but watcher liveness is stale; inspect state/.supervise-daemon.log and restart away mode. Stop the daemon or exit /afk before falling back to bin/fm-watch-arm.sh.'
-  elif "$queue_pending"; then
-    fix='After draining queued wakes, re-arm the watcher: run bin/fm-watch-arm.sh as the harness-tracked background task (never a shell & that gets reaped).'
-  else
-    fix='Re-arm it NOW: run bin/fm-watch-arm.sh as the harness-tracked background task (never a shell & that gets reaped).'
-  fi
   if [ "$print_full_banner" -eq 1 ]; then
+    if [ "$READ_ONLY" -eq 1 ]; then
+      fix='Watcher repair belongs to the session holding the fleet lock; do not drain or re-arm from this read-only session.'
+    elif [ "$daemon_delivery_gap" = true ]; then
+      fix='Stop the watcher host, or re-enter /afk if away mode should own delivery, then run bin/fm-watch-arm.sh as the harness-tracked background task (never a shell & that gets reaped).'
+    elif [ "$away_daemon_active" = true ]; then
+      fix='Away-mode daemon is live but watcher liveness is stale; inspect state/.supervise-daemon.log and restart away mode. Stop the daemon or exit /afk before falling back to bin/fm-watch-arm.sh.'
+    else
+      afk=0
+      [ -e "$STATE/.afk" ] && afk=1
+      queue_arg=0
+      "$queue_pending" && queue_arg=1
+      x_mode=0
+      [ -f "$CONFIG/x-mode.env" ] && x_mode=1
+      fix=$("$SCRIPT_DIR/fm-supervision-instructions.sh" \
+        --read-only "$READ_ONLY" \
+        --afk "$afk" \
+        --x-mode "$x_mode" \
+        --queue-pending "$queue_arg" \
+        --repair-line 2>/dev/null || printf '%s\n' 'Repair missing watcher supervision according to the session-start operating block.')
+    fi
     rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
     {
       printf '●%s\n' "$rule"
@@ -224,8 +233,9 @@ if [ "$watcher_fresh" = false ] || [ "$daemon_delivery_gap" = true ]; then
       elif [ "$away_daemon_active" = true ]; then
         printf '●  Away-mode watcher repair starts with the supervise daemon; use the plain watcher arm only after stopping the daemon or exiting /afk.\n'
       else
-        printf '●  Trust bin/fm-watch-arm.sh for the true state: it confirms a live watcher and a fresh beacon, or fails loudly.\n'
+        printf '●  Trust the emitted supervision protocol for this harness; do not use shell & for watcher repair.\n'
       fi
+      printf '●  %s\n' "$CONTINUE_LINE"
       printf '●  %s\n' "$fix"
       printf '●%s\n' "$rule"
     } >&2

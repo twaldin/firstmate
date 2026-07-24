@@ -1875,10 +1875,11 @@ test_neutral_host_respawns_watcher_between_wakes() {
     stop_daemon_pid "$daemon_pid"
     fail "neutral host did not queue a second wake after respawn; stderr=$(cat "$err" 2>/dev/null); log=$(cat "$state/.supervise-daemon.log" 2>/dev/null)"
   fi
+  if ! wait_for_file_contains "$state/.supervise-daemon.log" "neutral-host observed watcher wake already queued by watcher" 120; then
+    stop_daemon_pid "$daemon_pid"
+    fail "neutral host did not log watcher wake observation; log=$(cat "$state/.supervise-daemon.log" 2>/dev/null)"
+  fi
   stop_daemon_pid "$daemon_pid"
-
-  grep -F "neutral-host observed watcher wake already queued by watcher" "$state/.supervise-daemon.log" >/dev/null \
-    || fail "neutral host did not log watcher wake observation"
   pass "neutral host respawns one-shot watchers across consecutive queued wakes"
 }
 
@@ -1997,7 +1998,7 @@ test_away_mode_takes_over_existing_plain_watcher() {
     FM_SIGNAL_GRACE=0 \
     FM_HEARTBEAT=999999999 \
     FM_CHECK_INTERVAL=999999 \
-    bash -c 'trap "exit 0" TERM; . "$1"' _ "$WATCH" >"$plain_out" &
+    "$WATCH" >"$plain_out" 2>&1 &
   plain_pid=$!
 
   if ! wait_for_file_contains "$state/.watch.lock/pid" "$plain_pid" 80; then
@@ -2112,7 +2113,7 @@ test_away_mode_reclaims_runtime_watcher_lock_drift() {
     FM_SIGNAL_GRACE=999999 \
     FM_HEARTBEAT=999999999 \
     FM_CHECK_INTERVAL=999999 \
-    bash -c 'trap "exit 0" TERM; . "$1"' _ "$WATCH" > "$plain_out" &
+    "$WATCH" > "$plain_out" 2>&1 &
   plain_pid=$!
   i=0
   while [ "$i" -lt 80 ]; do
