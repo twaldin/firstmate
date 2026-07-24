@@ -19,7 +19,9 @@ set -u
 TMP_ROOT=$(fm_test_tmproot fm-turnend-guard)
 fm_git_identity fmtest fmtest@example.invalid
 
-REQUIRED_REASON='repair missing watcher supervision with bin/fm-watch-arm.sh as its own Claude Code background task'
+REQUIRED_REASON='tasks in flight, no live watcher - run bin/fm-watch-arm.sh as a background task before ending the turn'
+QUEUE_REASON='queued wakes pending - drain with bin/fm-wake-drain.sh before ending the turn when this session holds the fleet lock; read-only sessions must leave queued wakes for the lock holder'
+AWAY_REASON='away-mode daemon is live but watcher liveness is stale - inspect state/.supervise-daemon.log and restart away mode; stop the daemon or exit /afk before falling back to bin/fm-watch-arm.sh'
 
 # --- PREDICATE: bin/fm-supervision-lib.sh -----------------------------------
 
@@ -94,6 +96,7 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-primary-scope-lib.sh" "$dir/bin/fm-primary-scope-lib.sh"
   cp "$ROOT/bin/fm-supervision-lib.sh" "$dir/bin/fm-supervision-lib.sh"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
+  cp "$ROOT/bin/fm-lock-lib.sh" "$dir/bin/fm-lock-lib.sh"
   mkdir -p "$dir/docs"
   cp -R "$ROOT/docs/supervision-protocols" "$dir/docs/supervision-protocols"
   chmod +x "$dir/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-operational-input.sh" "$dir/bin/fm-supervision-instructions.sh" "$dir/bin/fm-harness.sh"
@@ -186,6 +189,22 @@ watcher_identity() {
   FM_STATE_OVERRIDE="$dir/state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$dir/bin/fm-wake-lib.sh" "$pid"
 }
 
+record_away_daemon() {
+  local dir=$1 pid=$2 identity
+  identity=$(watcher_identity "$dir" "$pid") || fail "could not identify live daemon holder"
+  printf '%s\n' "$pid" > "$dir/state/.supervise-daemon.pid"
+  printf '%s\n' "$identity" > "$dir/state/.supervise-daemon.pid-identity"
+  printf 'away\n' > "$dir/state/.supervise-daemon.mode"
+}
+
+record_neutral_daemon() {
+  local dir=$1 pid=$2 identity
+  identity=$(watcher_identity "$dir" "$pid") || fail "could not identify live neutral daemon holder"
+  printf '%s\n' "$pid" > "$dir/state/.supervise-daemon.pid"
+  printf '%s\n' "$identity" > "$dir/state/.supervise-daemon.pid-identity"
+  printf 'neutral\n' > "$dir/state/.supervise-daemon.mode"
+}
+
 record_watcher_lock() {
   local dir=$1 pid=$2 identity=$3 root bin_dir
   root=$(cd "$dir" && pwd)
@@ -197,6 +216,11 @@ record_watcher_lock() {
   printf '%s\n' "$identity" > "$dir/state/.watch.lock/pid-identity"
 }
 
+record_session_lock() {
+  local dir=$1
+  printf '%s\n' "$$" > "$dir/state/.lock"
+}
+
 test_hook_silent_when_no_work_in_flight() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-idle")
@@ -204,6 +228,210 @@ test_hook_silent_when_no_work_in_flight() {
   expect_code 0 "$status" "hook must exit 0 with no in-flight work"
   [ -z "$out" ] || fail "hook produced output with no in-flight work: $out"
   pass "fm-turnend-guard: silent no-op with nothing in flight"
+}
+
+test_hook_blocks_when_queue_pending_without_inflight() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-queue-idle")
+  record_session_lock "$dir"
+  printf 'record\n' > "$dir/state/.wake-queue"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "hook must block when queued wakes are pending, even without in-flight work"
+  assert_contains "$out" "$QUEUE_REASON" "queue block reason must contain the exact drain instruction"
+  assert_contains "$out" "TURN WOULD END WITH QUEUED WAKES UNDRAINED" "queue block banner must read as an alarm"
+  pass "fm-turnend-guard: blocks when queued wakes are pending without in-flight work"
+}
+
+test_hook_silent_when_queue_pending_with_live_away_daemon() {
+  local dir daemon_pid watcher_pid watcher_identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-queue-away-live")
+  record_session_lock "$dir"
+  date '+%s' > "$dir/state/.afk"
+  printf 'record\n' > "$dir/state/.wake-queue"
+  sleep 60 &
+  daemon_pid=$!
+  record_away_daemon "$dir" "$daemon_pid"
+  sleep 60 &
+  watcher_pid=$!
+  watcher_identity=$(watcher_identity "$dir" "$watcher_pid") || {
+    kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "could not identify live watcher holder"
+  }
+  record_watcher_lock "$dir" "$watcher_pid" "$watcher_identity"
+  printf '%s\n' "$watcher_pid" > "$dir/state/.supervise-daemon.watcher.pid"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  expect_code 0 "$status" "hook must not block queued wakes while a live away daemon and hosted watcher own catch-up"
+  [ -z "$out" ] || fail "hook produced output for queued wakes under a live away daemon and watcher: $out"
+  pass "fm-turnend-guard: does not block queued wakes while a live away daemon and watcher own catch-up"
+}
+
+test_hook_silent_during_away_respawn_gap_with_fresh_beacon() {
+  local dir pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-queue-away-respawn-gap")
+  record_session_lock "$dir"
+  date '+%s' > "$dir/state/.afk"
+  printf 'record\n' > "$dir/state/.wake-queue"
+  touch "$dir/state/.last-watcher-beat"
+  sleep 60 &
+  pid=$!
+  record_away_daemon "$dir" "$pid"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "hook must tolerate an away daemon one-shot respawn gap while the beacon is still fresh"
+  [ -z "$out" ] || fail "hook produced output during a fresh away respawn gap: $out"
+  pass "fm-turnend-guard: tolerates away daemon respawn gaps within beacon grace"
+}
+
+test_hook_blocks_when_live_away_daemon_has_no_afk() {
+  local dir pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-queue-away-noafk")
+  record_session_lock "$dir"
+  printf 'record\n' > "$dir/state/.wake-queue"
+  sleep 60 &
+  pid=$!
+  record_away_daemon "$dir" "$pid"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 2 "$status" "hook must block queued wakes when away daemon is live but .afk is absent"
+  assert_contains "$out" "$QUEUE_REASON" "no-afk away daemon queue block reason must contain the exact drain instruction"
+  pass "fm-turnend-guard: blocks queued wakes when live away daemon has no afk presence gate"
+}
+
+test_hook_blocks_when_away_daemon_hosted_watcher_has_no_afk_without_queue() {
+  local dir daemon_pid watcher_pid watcher_identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-away-hosted-noafk-empty")
+  record_session_lock "$dir"
+  : > "$dir/state/task1.meta"
+  sleep 60 &
+  daemon_pid=$!
+  record_away_daemon "$dir" "$daemon_pid"
+  sleep 60 &
+  watcher_pid=$!
+  watcher_identity=$(watcher_identity "$dir" "$watcher_pid") || {
+    kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "could not identify away-hosted watcher without .afk"
+  }
+  record_watcher_lock "$dir" "$watcher_pid" "$watcher_identity"
+  printf '%s\n' "$watcher_pid" > "$dir/state/.supervise-daemon.watcher.pid"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  expect_code 2 "$status" "hook must block when an away daemon-hosted watcher has no .afk presence gate"
+  assert_contains "$out" 'watcher is daemon-hosted in mode=away without verified away-mode ownership' "away daemon-hosted no-afk block must explain missing verified ownership"
+  assert_contains "$out" 'Stop the watcher host, or re-enter /afk' "away daemon-hosted no-afk block must give repair"
+  pass "fm-turnend-guard: blocks away daemon-hosted watcher without .afk even when queue is empty"
+}
+
+test_hook_blocks_when_foreign_watcher_holds_away_lock() {
+  local dir daemon_pid watcher_pid watcher_identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-queue-away-foreign-watch")
+  record_session_lock "$dir"
+  date '+%s' > "$dir/state/.afk"
+  printf 'record\n' > "$dir/state/.wake-queue"
+  sleep 60 &
+  daemon_pid=$!
+  record_away_daemon "$dir" "$daemon_pid"
+  sleep 60 &
+  watcher_pid=$!
+  watcher_identity=$(watcher_identity "$dir" "$watcher_pid") || {
+    kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "could not identify foreign watcher holder"
+  }
+  record_watcher_lock "$dir" "$watcher_pid" "$watcher_identity"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  expect_code 2 "$status" "hook must block when a non-daemon watcher owns the lock during away mode"
+  assert_contains "$out" "$AWAY_REASON" "foreign watcher lock must use away repair guidance"
+  pass "fm-turnend-guard: blocks away mode when a foreign watcher owns the lock"
+}
+
+test_hook_blocks_when_away_daemon_identity_missing() {
+  local dir pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-queue-away-noid")
+  record_session_lock "$dir"
+  date '+%s' > "$dir/state/.afk"
+  printf 'record\n' > "$dir/state/.wake-queue"
+  sleep 60 &
+  pid=$!
+  printf '%s\n' "$pid" > "$dir/state/.supervise-daemon.pid"
+  printf 'away\n' > "$dir/state/.supervise-daemon.mode"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 2 "$status" "hook must block queued wakes when away daemon identity is absent"
+  assert_contains "$out" "$QUEUE_REASON" "missing-identity away daemon queue block reason must contain the exact drain instruction"
+  pass "fm-turnend-guard: blocks queued wakes when away daemon pid identity is absent"
+}
+
+test_hook_blocks_when_queue_pending_with_stale_afk() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-queue-stale-afk")
+  record_session_lock "$dir"
+  date '+%s' > "$dir/state/.afk"
+  printf 'record\n' > "$dir/state/.wake-queue"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "hook must block queued wakes when .afk is stale and no away daemon is live"
+  assert_contains "$out" "$QUEUE_REASON" "stale afk queue block reason must contain the exact drain instruction"
+  pass "fm-turnend-guard: blocks queued wakes when .afk is stale without a live away daemon"
+}
+
+test_hook_silent_when_queue_pending_without_session_lock() {
+  local dir pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-queue-foreign-harness-lock")
+  printf 'record\n' > "$dir/state/.wake-queue"
+  bash -c 'exec -a claude sleep 60' &
+  pid=$!
+  printf '%s\n' "$pid" > "$dir/state/.lock"
+  out=$(FM_TURNEND_HARNESS_PID_OVERRIDE=$$ run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 0 "$status" "hook must not block queued wakes owned by another session lock"
+  [ -z "$out" ] || fail "hook produced output for queued wakes under a foreign lock: $out"
+  pass "fm-turnend-guard: does not block queued wakes under a foreign session lock"
+}
+
+test_hook_blocks_when_queue_pending_with_live_non_harness_lock() {
+  local dir pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-queue-non-harness-lock")
+  printf 'record\n' > "$dir/state/.wake-queue"
+  sleep 60 &
+  pid=$!
+  printf '%s\n' "$pid" > "$dir/state/.lock"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 2 "$status" "hook must block queued wakes when lock pid is live but not a harness"
+  assert_contains "$out" "$QUEUE_REASON" "non-harness lock queue block reason must contain the exact drain instruction"
+  pass "fm-turnend-guard: blocks queued wakes under a live non-harness session lock"
+}
+
+test_hook_blocks_when_queue_pending_with_stale_session_lock() {
+  local dir dead out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-queue-stale-lock")
+  dead=$(nonexistent_pid)
+  printf '%s\n' "$dead" > "$dir/state/.lock"
+  printf 'record\n' > "$dir/state/.wake-queue"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "hook must block queued wakes when the session lock pid is stale"
+  assert_contains "$out" "$QUEUE_REASON" "stale-lock queue block reason must contain the exact drain instruction"
+  pass "fm-turnend-guard: blocks queued wakes under a stale session lock"
 }
 
 test_hook_blocks_when_fresh_beacon_has_no_live_lock() {
@@ -249,6 +477,91 @@ test_hook_silent_with_live_lock_and_fresh_beacon() {
   expect_code 0 "$status" "hook must exit 0 with a live identity-matched watcher lock and fresh beacon"
   [ -z "$out" ] || fail "hook produced output despite a live fresh watcher lock: $out"
   pass "fm-turnend-guard: silent no-op with a live watcher lock and fresh beacon"
+}
+
+test_hook_blocks_when_queue_pending_with_live_lock() {
+  local dir pid identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-queue-live-lock")
+  record_session_lock "$dir"
+  : > "$dir/state/task1.meta"
+  printf 'record\n' > "$dir/state/.wake-queue"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify live watcher holder"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 2 "$status" "hook must block queued wakes even with a live identity-matched watcher lock"
+  assert_contains "$out" "$QUEUE_REASON" "queue block reason must contain the exact drain instruction"
+  pass "fm-turnend-guard: blocks queued wakes despite a live watcher lock and fresh beacon"
+}
+
+test_hook_blocks_watcher_gap_with_live_away_daemon() {
+  local dir pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-away-watcher-gap")
+  record_session_lock "$dir"
+  date '+%s' > "$dir/state/.afk"
+  : > "$dir/state/task1.meta"
+  printf 'record\n' > "$dir/state/.wake-queue"
+  sleep 60 &
+  pid=$!
+  record_away_daemon "$dir" "$pid"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 2 "$status" "hook must block when away daemon is live but the hosted watcher is not healthy"
+  assert_contains "$out" "$AWAY_REASON" "away watcher-gap block must point at the daemon repair path"
+  assert_contains "$out" "$QUEUE_REASON" "away watcher-gap block must also mention pending queued wakes"
+  assert_not_contains "$out" "$REQUIRED_REASON" "away watcher-gap block must not use the generic plain-watcher repair"
+  pass "fm-turnend-guard: blocks away watcher gaps and queued wakes together"
+}
+
+test_hook_blocks_neutral_daemon_hosted_watcher_with_inflight() {
+  local dir daemon_pid watcher_pid watcher_identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-neutral-hosted-watch")
+  record_session_lock "$dir"
+  : > "$dir/state/task1.meta"
+  sleep 60 &
+  daemon_pid=$!
+  record_neutral_daemon "$dir" "$daemon_pid"
+  sleep 60 &
+  watcher_pid=$!
+  watcher_identity=$(watcher_identity "$dir" "$watcher_pid") || {
+    kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "could not identify neutral-hosted watcher"
+  }
+  record_watcher_lock "$dir" "$watcher_pid" "$watcher_identity"
+  printf '%s\n' "$watcher_pid" > "$dir/state/.supervise-daemon.watcher.pid"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  expect_code 2 "$status" "hook must block when a neutral daemon-hosted watcher cannot wake firstmate"
+  assert_contains "$out" 'watcher is daemon-hosted in mode=neutral without verified away-mode ownership' "neutral daemon-hosted watcher block must explain missing wake delivery"
+  assert_contains "$out" 'Stop the watcher host, or re-enter /afk' "neutral daemon-hosted watcher block must give repair"
+  pass "fm-turnend-guard: blocks neutral daemon-hosted watcher delivery gaps"
+}
+
+test_hook_combines_queue_and_watcher_blocks() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-queue-watch")
+  record_session_lock "$dir"
+  : > "$dir/state/task1.meta"
+  printf 'record\n' > "$dir/state/.wake-queue"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "hook must block when both queued wakes and missing watcher are true"
+  assert_contains "$out" "$QUEUE_REASON" "combined block must include the queue remediation"
+  assert_contains "$out" "$REQUIRED_REASON" "combined block must include the watcher remediation"
+  pass "fm-turnend-guard: combines queued-wake and watcher-liveness blocks in one stop hook response"
 }
 
 test_hook_blocks_with_live_lock_and_stale_beacon() {
@@ -919,9 +1232,24 @@ test_predicate_unhealthy_stale_beacon
 test_predicate_healthy_fresh_beacon
 test_predicate_queue_pending_flag
 test_hook_silent_when_no_work_in_flight
+test_hook_blocks_when_queue_pending_without_inflight
+test_hook_silent_when_queue_pending_with_live_away_daemon
+test_hook_silent_during_away_respawn_gap_with_fresh_beacon
+test_hook_blocks_when_live_away_daemon_has_no_afk
+test_hook_blocks_when_away_daemon_hosted_watcher_has_no_afk_without_queue
+test_hook_blocks_when_foreign_watcher_holds_away_lock
+test_hook_blocks_when_away_daemon_identity_missing
+test_hook_blocks_when_queue_pending_with_stale_afk
+test_hook_silent_when_queue_pending_without_session_lock
+test_hook_blocks_when_queue_pending_with_live_non_harness_lock
+test_hook_blocks_when_queue_pending_with_stale_session_lock
 test_hook_blocks_when_fresh_beacon_has_no_live_lock
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
+test_hook_blocks_when_queue_pending_with_live_lock
+test_hook_blocks_watcher_gap_with_live_away_daemon
+test_hook_blocks_neutral_daemon_hosted_watcher_with_inflight
+test_hook_combines_queue_and_watcher_blocks
 test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_blocks_when_unhealthy_in_primary
 test_hook_blocks_from_fm_home_state

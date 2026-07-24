@@ -4,13 +4,15 @@
 #
 # Usage: fm-afk-start.sh
 #   Sets state/.afk unless FM_AFK_STATE_PREPARED=1, checks
-#   state/.supervise-daemon.lock, and:
+#   state/.supervise-daemon.lock and state/.supervise-daemon.mode, and:
 #     - prints "afk: daemon already running pid=<pid>" then exits 0 when that
-#       lock is held by a live daemon (a REFRESH: no stale-artifact clear);
+#       lock is held by a live away-mode daemon (a REFRESH: no stale-artifact clear);
+#     - stops a live neutral watcher host because state/.afk alone never
+#       upgrades neutral supervision into away mode;
 #     - otherwise clears any prior away session's stale escalation artifacts
 #       (fm_afk_clear_stale_artifacts) for a direct, non-prepared start, then
-#       execs bin/fm-supervise-daemon.sh in the foreground. A prepared start was
-#       already cleared transactionally by bin/fm-afk-launch.sh.
+#       execs bin/fm-supervise-daemon.sh --away-mode in the foreground.
+#       A prepared start was already cleared transactionally by bin/fm-afk-launch.sh.
 #
 # This file is sourceable: its BASH_SOURCE guard keeps main from running, while
 # exposing the daemon-lock helpers and fm_afk_clear_stale_artifacts. Sourcing it
@@ -107,7 +109,25 @@ daemon_lock_held_by_live_daemon() {
   owner=$(daemon_lock_owner) || return 1
   pid=$(cat "$owner/pid" 2>/dev/null || true)
   fm_pid_alive "$pid" || return 1
+  daemon_pid_matches "$pid" "$owner" || return 1
+  [ "$(cat "$FM_AFK_STATE/.supervise-daemon.mode" 2>/dev/null || true)" = away ]
+}
+
+daemon_lock_held_by_live_any_daemon() {
+  local owner pid
+  owner=$(daemon_lock_owner) || return 1
+  pid=$(cat "$owner/pid" 2>/dev/null || true)
+  fm_pid_alive "$pid" || return 1
   daemon_pid_matches "$pid" "$owner"
+}
+
+daemon_wait_for_stop() {
+  local pid=$1 i=0
+  while fm_pid_alive "$pid" && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  ! fm_pid_alive "$pid"
 }
 
 fm_afk_start_main() {
@@ -131,7 +151,14 @@ fm_afk_start_main() {
     return 0
   fi
 
-  if fm_pid_alive "$pid" && [ -n "$pid" ]; then
+  if daemon_lock_held_by_live_any_daemon; then
+    echo "afk: replacing neutral supervise daemon pid=$pid with away-mode daemon"
+    kill "$pid" 2>/dev/null || true
+    if ! daemon_wait_for_stop "$pid"; then
+      echo "afk: live supervise daemon pid=$pid did not stop" >&2
+      return 1
+    fi
+  elif fm_pid_alive "$pid" && [ -n "$pid" ]; then
     fm_lock_remove_path "$FM_AFK_LOCK" 2>/dev/null || true
   fi
 
@@ -142,7 +169,7 @@ fm_afk_start_main() {
   fi
 
   echo "afk: starting supervise daemon in foreground; keep this command as a tracked background session"
-  exec "$FM_AFK_DAEMON"
+  exec env FM_SUPERVISE_AWAY_MODE=1 "$FM_AFK_DAEMON" --away-mode
 }
 
 # Run only when executed, not when sourced (tests source fm_afk_clear_stale_artifacts

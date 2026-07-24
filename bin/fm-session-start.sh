@@ -399,8 +399,7 @@ EOF
 elif [ "$AFK_PRESENT" -eq 1 ]; then
   cat <<'EOF'
 Away mode is active. Do not arm the normal watcher directly; load /afk and
-ensure the daemon is running with --away-mode, because the away-mode daemon
-owns watcher supervision.
+ensure the daemon owns watcher supervision by running with --away-mode.
 
 EOF
 elif [ -f "$CONFIG/x-mode.env" ]; then

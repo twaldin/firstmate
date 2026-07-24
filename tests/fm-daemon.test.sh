@@ -12,6 +12,7 @@ set -u
 
 DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
 AFK_START="$ROOT/bin/fm-afk-start.sh"
+WATCH="$ROOT/bin/fm-watch.sh"
 # Source the daemon's pure functions once. Its main loop is skipped under sourcing
 # via a BASH_SOURCE guard, so only classify_*/housekeeping/escalate_*/afk_* and the
 # pane/submit helpers become defined.
@@ -39,6 +40,17 @@ wait_for_file_empty() {
   local file=$1 limit=${2:-80} i=0
   while [ "$i" -lt "$limit" ]; do
     [ ! -s "$file" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+wait_for_queue_kind_count() {
+  local queue=$1 kind=$2 want=$3 limit=${4:-80} i=0 got
+  while [ "$i" -lt "$limit" ]; do
+    got=$(awk -F '\t' -v kind="$kind" 'NF >= 5 && $3 == kind { c++ } END { print c + 0 }' "$queue" 2>/dev/null || echo 0)
+    [ "$got" -ge "$want" ] && return 0
     sleep 0.1
     i=$((i + 1))
   done
@@ -1705,6 +1717,7 @@ test_inject_msg_herdr_pane_gone_defers() {
     if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:gone" inject_msg "hello" "$state"; then
       fail "inject_msg should defer when the herdr target does not exist"
     fi
+    [ -e "$state/.subsuper-target-gone" ] || fail "missing target did not write target-gone backoff marker"
   ) || fail "herdr pane-gone inject_msg subshell failed"
   pass "inject_msg: herdr pane-gone check defers before any busy/composer/submit call"
 }
@@ -1796,6 +1809,501 @@ SH
   grep -F "mode=neutral-host" "$state/.supervise-daemon.log" >/dev/null \
     || fail "neutral host startup mode was not logged"
   pass "default neutral host queues watcher wakes without afk, injection target, or .subsuper side effects"
+}
+
+test_neutral_host_respawns_watcher_between_wakes() {
+  local dir state fakebin status_a status_b out err daemon_pid first_pid second_pid i
+  dir=$(make_supercase neutral-host-respawn)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  status_a="$state/respawn-a.status"
+  status_b="$state/respawn-b.status"
+  out="$dir/daemon.out"
+  err="$dir/daemon.err"
+
+  PATH="$fakebin:$PATH" \
+    FM_STATE_OVERRIDE="$state" \
+    FM_POLL=1 \
+    FM_SIGNAL_GRACE=0 \
+    FM_HEARTBEAT=999999 \
+    FM_CHECK_INTERVAL=999999 \
+    "$DAEMON" --neutral-host >"$out" 2>"$err" &
+  daemon_pid=$!
+
+  first_pid=
+  i=0
+  while [ "$i" -lt 100 ]; do
+    first_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+    case "$first_pid" in
+      ''|*[!0-9]*) ;;
+      *) kill -0 "$first_pid" 2>/dev/null && break ;;
+    esac
+    sleep 0.1
+    i=$((i + 1))
+  done
+  case "$first_pid" in
+    ''|*[!0-9]*) stop_daemon_pid "$daemon_pid"; fail "neutral host never started an initial watcher; stderr=$(cat "$err" 2>/dev/null)" ;;
+  esac
+
+  printf 'done: first neutral respawn wake\n' > "$status_a"
+  if ! wait_for_queue_kind_count "$state/.wake-queue" signal 1 120; then
+    stop_daemon_pid "$daemon_pid"
+    fail "neutral host did not queue the first watcher wake; stderr=$(cat "$err" 2>/dev/null); log=$(cat "$state/.supervise-daemon.log" 2>/dev/null)"
+  fi
+
+  second_pid=
+  i=0
+  while [ "$i" -lt 120 ]; do
+    second_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+    case "$second_pid" in
+      ''|*[!0-9]*) ;;
+      "$first_pid") ;;
+      *) kill -0 "$second_pid" 2>/dev/null && break ;;
+    esac
+    sleep 0.1
+    i=$((i + 1))
+  done
+  case "$second_pid" in
+    ''|*[!0-9]*|"$first_pid")
+      stop_daemon_pid "$daemon_pid"
+      fail "neutral host did not respawn a fresh watcher after the first wake (first=$first_pid second=${second_pid:-}); log=$(cat "$state/.supervise-daemon.log" 2>/dev/null)"
+      ;;
+  esac
+
+  printf 'done: second neutral respawn wake\n' > "$status_b"
+  if ! wait_for_queue_kind_count "$state/.wake-queue" signal 2 120; then
+    stop_daemon_pid "$daemon_pid"
+    fail "neutral host did not queue a second wake after respawn; stderr=$(cat "$err" 2>/dev/null); log=$(cat "$state/.supervise-daemon.log" 2>/dev/null)"
+  fi
+  stop_daemon_pid "$daemon_pid"
+
+  grep -F "neutral-host observed watcher wake already queued by watcher" "$state/.supervise-daemon.log" >/dev/null \
+    || fail "neutral host did not log watcher wake observation"
+  pass "neutral host respawns one-shot watchers across consecutive queued wakes"
+}
+
+test_neutral_host_ignores_afk_without_away_mode() {
+  local dir state fakebin calls status_file out err pid f
+  dir=$(make_supercase neutral-host-afk)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  calls="$dir/tmux.calls"
+  status_file="$state/neutral-afk.status"
+  out="$dir/daemon.out"
+  err="$dir/daemon.err"
+  : > "$calls"
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_FAKE_TMUX_CALLS:?FM_FAKE_TMUX_CALLS unset}"
+exit 19
+SH
+  chmod +x "$fakebin/tmux"
+  make_fake_crew_state "$fakebin" >/dev/null
+  printf 'working: routine note\n' > "$status_file"
+  date '+%s' > "$state/.afk"
+
+  PATH="$fakebin:$PATH" \
+    FM_FAKE_TMUX_CALLS="$calls" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)' \
+    FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STATE_OVERRIDE="$state" \
+    FM_POLL=1 \
+    FM_SIGNAL_GRACE=0 \
+    FM_HEARTBEAT=999999 \
+    FM_CHECK_INTERVAL=999999 \
+    "$DAEMON" --neutral-host >"$out" 2>"$err" &
+  pid=$!
+
+  if ! wait_for_file_contains "$state/.watch-triage.log" "absorbed benign signal" 80; then
+    stop_daemon_pid "$pid"
+    fail "neutral host did not preserve normal watcher triage while .afk existed; stderr=$(cat "$err" 2>/dev/null); log=$(cat "$state/.supervise-daemon.log" 2>/dev/null)"
+  fi
+  stop_daemon_pid "$pid"
+
+  [ ! -s "$state/.wake-queue" ] || fail "neutral host queued a benign signal because .afk existed"
+  for f in "$state"/.subsuper-*; do
+    [ ! -e "$f" ] || fail "neutral host wrote away-mode state while .afk existed: $f"
+  done
+  [ ! -s "$calls" ] || fail "neutral host resolved or probed an injection pane while .afk existed: $(cat "$calls")"
+  grep -F "mode=neutral-host" "$state/.supervise-daemon.log" >/dev/null \
+    || fail "neutral host startup mode was not logged while .afk existed"
+  pass "neutral host ignores .afk without the explicit away-mode opt-in"
+}
+
+test_default_neutral_refuses_afk_without_explicit_host_flag() {
+  local dir state out err status
+  dir=$(make_supercase neutral-default-afk-refuse)
+  state="$dir/state"
+  out="$dir/daemon.out"
+  err="$dir/daemon.err"
+  date '+%s' > "$state/.afk"
+
+  status=0
+  FM_STATE_OVERRIDE="$state" "$DAEMON" >"$out" 2>"$err" || status=$?
+
+  [ "$status" -ne 0 ] || fail "default neutral daemon started under .afk without an explicit neutral flag"
+  grep -F 'use --away-mode for away supervision or --neutral-host to force a neutral watcher host' "$err" >/dev/null \
+    || fail "default neutral refusal did not explain the explicit modes: $(cat "$err" 2>/dev/null)"
+  [ ! -e "$state/.supervise-daemon.pid" ] || fail "default neutral refusal wrote a pidfile"
+  [ ! -e "$state/.watch.lock" ] || fail "default neutral refusal started a watcher"
+  grep -F 'startup failed: neutral default refused while state/.afk exists' "$state/.supervise-daemon.log" >/dev/null \
+    || fail "default neutral refusal was not logged"
+  pass "default neutral daemon refuses .afk unless neutral hosting is explicit"
+}
+
+test_false_env_neutral_allows_explicit_afk_hosting() {
+  local dir state out err pid
+  dir=$(make_supercase neutral-false-env-afk)
+  state="$dir/state"
+  out="$dir/daemon.out"
+  err="$dir/daemon.err"
+  date '+%s' > "$state/.afk"
+
+  FM_SUPERVISE_AWAY_MODE=0 \
+    FM_STATE_OVERRIDE="$state" \
+    FM_POLL=5 \
+    FM_SIGNAL_GRACE=999999 \
+    FM_HEARTBEAT=999999 \
+    FM_CHECK_INTERVAL=999999 \
+    "$DAEMON" >"$out" 2>"$err" &
+  pid=$!
+  if ! wait_for_file_contains "$state/.supervise-daemon.log" "mode=neutral-host" 80; then
+    stop_daemon_pid "$pid"
+    fail "explicit false env neutral host did not start under .afk: stderr=$(cat "$err" 2>/dev/null)"
+  fi
+  stop_daemon_pid "$pid"
+  grep -F 'away behavior remains off' "$state/.supervise-daemon.log" >/dev/null \
+    || fail "explicit false env neutral host did not log away behavior off"
+  pass "FM_SUPERVISE_AWAY_MODE=0 explicitly allows neutral hosting under .afk"
+}
+
+test_away_mode_takes_over_existing_plain_watcher() {
+  local dir state fakebin sent capture status_file plain_out daemon_out daemon_err plain_pid daemon_pid i
+  dir=$(make_supercase away-mode-takeover)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"
+  capture="$dir/pane.txt"
+  status_file="$state/takeover.status"
+  plain_out="$dir/plain-watch.out"
+  daemon_out="$dir/daemon.out"
+  daemon_err="$dir/daemon.err"
+  : > "$sent"
+  : > "$capture"
+
+  PATH="$fakebin:$PATH" \
+    FM_STATE_OVERRIDE="$state" \
+    FM_POLL=1 \
+    FM_SIGNAL_GRACE=0 \
+    FM_HEARTBEAT=999999999 \
+    FM_CHECK_INTERVAL=999999 \
+    bash -c 'trap "exit 0" TERM; . "$1"' _ "$WATCH" >"$plain_out" &
+  plain_pid=$!
+
+  if ! wait_for_file_contains "$state/.watch.lock/pid" "$plain_pid" 80; then
+    kill "$plain_pid" 2>/dev/null || true
+    wait "$plain_pid" 2>/dev/null || true
+    fail "plain watcher did not acquire the watcher lock before away takeover"
+  fi
+
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" \
+    FM_STATE_OVERRIDE="$state" \
+    FM_SUPERVISOR_BACKEND=tmux \
+    FM_SUPERVISOR_TARGET=fakepane \
+    FM_FAKE_TMUX_PANE_ALIVE=1 \
+    FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" \
+    FM_ESCALATE_BATCH_SECS=0 \
+    FM_HEARTBEAT_SCAN_SECS=999999 \
+    FM_HOUSEKEEPING_TICK=1 \
+    FM_INJECT_SKIP=heartbeat \
+    FM_POLL=1 \
+    FM_SIGNAL_GRACE=0 \
+    FM_HEARTBEAT=999999999 \
+    FM_CHECK_INTERVAL=999999 \
+    "$DAEMON" --away-mode >"$daemon_out" 2>"$daemon_err" &
+  daemon_pid=$!
+
+  i=0
+  while [ "$i" -lt 80 ] && kill -0 "$plain_pid" 2>/dev/null; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if kill -0 "$plain_pid" 2>/dev/null; then
+    stop_daemon_pid "$daemon_pid"
+    kill "$plain_pid" 2>/dev/null || true
+    wait "$plain_pid" 2>/dev/null || true
+    fail "away-mode daemon did not stop the pre-existing plain watcher"
+  fi
+  wait "$plain_pid" 2>/dev/null || true
+
+  printf 'done: PR https://example.test/pr/takeover\n' > "$status_file"
+  if ! wait_for_file_contains "$sent" "Supervisor escalate" 200; then
+    stop_daemon_pid "$daemon_pid"
+    fail "away-mode daemon did not inject after taking over the watcher lock; stderr=$(cat "$daemon_err" 2>/dev/null); log=$(cat "$state/.supervise-daemon.log" 2>/dev/null); sent=$(cat "$sent" 2>/dev/null)"
+  fi
+  stop_daemon_pid "$daemon_pid"
+
+  grep -F "away mode stopping existing watcher pid $plain_pid" "$state/.supervise-daemon.log" >/dev/null \
+    || fail "away-mode daemon did not log the plain watcher handoff"
+  grep -F "done: PR https://example.test/pr/takeover" "$sent" >/dev/null \
+    || fail "away-mode takeover digest did not include the terminal status"
+  grep -F "signal" "$state/.wake-queue" >/dev/null \
+    || fail "away-mode takeover watcher did not queue the terminal signal"
+  pass "away-mode daemon takes watcher ownership from a pre-existing plain watcher"
+}
+
+test_away_mode_reclaims_runtime_watcher_lock_drift() {
+  local dir state fakebin sent capture daemon_out daemon_err plain_out daemon_pid hosted_pid plain_pid i new_hosted plain_live
+  dir=$(make_supercase away-mode-runtime-reclaim)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"
+  capture="$dir/pane.txt"
+  daemon_out="$dir/daemon.out"
+  daemon_err="$dir/daemon.err"
+  plain_out="$dir/plain-watch.out"
+  : > "$sent"
+  : > "$capture"
+
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" \
+    FM_STATE_OVERRIDE="$state" \
+    FM_SUPERVISOR_BACKEND=tmux \
+    FM_SUPERVISOR_TARGET=fakepane \
+    FM_FAKE_TMUX_PANE_ALIVE=1 \
+    FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" \
+    FM_ESCALATE_BATCH_SECS=0 \
+    FM_HEARTBEAT_SCAN_SECS=999999 \
+    FM_HOUSEKEEPING_TICK=1 \
+    FM_INJECT_SKIP=heartbeat \
+    FM_POLL=0.2 \
+    FM_SIGNAL_GRACE=999999 \
+    FM_HEARTBEAT=999999999 \
+    FM_CHECK_INTERVAL=999999 \
+    "$DAEMON" --away-mode >"$daemon_out" 2>"$daemon_err" &
+  daemon_pid=$!
+
+  i=0
+  while [ "$i" -lt 100 ]; do
+    hosted_pid=$(cat "$state/.supervise-daemon.watcher.pid" 2>/dev/null || true)
+    if [ -n "$hosted_pid" ] && [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$hosted_pid" ]; then
+      break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [ -z "${hosted_pid:-}" ] || [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" != "$hosted_pid" ]; then
+    stop_daemon_pid "$daemon_pid"
+    fail "away daemon did not establish a hosted watcher before drift test; stderr=$(cat "$daemon_err" 2>/dev/null); log=$(cat "$state/.supervise-daemon.log" 2>/dev/null)"
+  fi
+
+  kill "$hosted_pid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 80 ] && kill -0 "$hosted_pid" 2>/dev/null; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  PATH="$fakebin:$PATH" \
+    FM_STATE_OVERRIDE="$state" \
+    FM_POLL=5 \
+    FM_SIGNAL_GRACE=999999 \
+    FM_HEARTBEAT=999999999 \
+    FM_CHECK_INTERVAL=999999 \
+    bash -c 'trap "exit 0" TERM; . "$1"' _ "$WATCH" > "$plain_out" &
+  plain_pid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$plain_pid" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" != "$plain_pid" ]; then
+    stop_daemon_pid "$daemon_pid"
+    kill "$plain_pid" 2>/dev/null || true
+    wait "$plain_pid" 2>/dev/null || true
+    fail "plain watcher did not acquire the lock during daemon respawn gap"
+  fi
+
+  i=0
+  while [ "$i" -lt 150 ] && kill -0 "$plain_pid" 2>/dev/null; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  i=0
+  while [ "$i" -lt 100 ]; do
+    new_hosted=$(cat "$state/.supervise-daemon.watcher.pid" 2>/dev/null || true)
+    [ -n "$new_hosted" ] && [ "$new_hosted" != "$plain_pid" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  stop_daemon_pid "$daemon_pid"
+  plain_live=0
+  if kill -0 "$plain_pid" 2>/dev/null; then
+    plain_live=1
+    kill "$plain_pid" 2>/dev/null || true
+  fi
+  wait "$plain_pid" 2>/dev/null || true
+
+  [ "$plain_live" -eq 0 ] || fail "away daemon did not kill a same-home watcher that stole ownership"
+  grep -F "away mode reclaiming watcher ownership from pid $plain_pid" "$state/.supervise-daemon.log" >/dev/null \
+    || fail "away daemon did not log runtime watcher ownership reclaim: $(cat "$state/.supervise-daemon.log" 2>/dev/null)"
+  [ -n "$new_hosted" ] && [ "$new_hosted" != "$plain_pid" ] \
+    || fail "away daemon did not spawn a replacement hosted watcher after reclaim"
+  pass "away-mode daemon reclaims runtime watcher lock drift before idling"
+}
+
+test_away_mode_retries_unreclaimable_runtime_watcher_lock_drift() {
+  local dir state fakebin sent capture daemon_out daemon_err daemon_pid hosted_pid foreign_pid foreign_identity i
+  dir=$(make_supercase away-mode-runtime-reclaim-fails)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/sent.log"
+  capture="$dir/pane.txt"
+  daemon_out="$dir/daemon.out"
+  daemon_err="$dir/daemon.err"
+  : > "$sent"
+  : > "$capture"
+
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" \
+    FM_STATE_OVERRIDE="$state" \
+    FM_SUPERVISOR_BACKEND=tmux \
+    FM_SUPERVISOR_TARGET=fakepane \
+    FM_FAKE_TMUX_PANE_ALIVE=1 \
+    FM_FAKE_TMUX_SENT="$sent" \
+    FM_FAKE_TMUX_CAPTURE="$capture" \
+    FM_ESCALATE_BATCH_SECS=0 \
+    FM_HEARTBEAT_SCAN_SECS=999999 \
+    FM_HOUSEKEEPING_TICK=1 \
+    FM_INJECT_SKIP=heartbeat \
+    FM_POLL=0.2 \
+    FM_SIGNAL_GRACE=999999 \
+    FM_HEARTBEAT=999999999 \
+    FM_CHECK_INTERVAL=999999 \
+    "$DAEMON" --away-mode >"$daemon_out" 2>"$daemon_err" &
+  daemon_pid=$!
+
+  i=0
+  while [ "$i" -lt 100 ]; do
+    hosted_pid=$(cat "$state/.supervise-daemon.watcher.pid" 2>/dev/null || true)
+    if [ -n "$hosted_pid" ] && [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$hosted_pid" ]; then
+      break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [ -z "${hosted_pid:-}" ] || [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" != "$hosted_pid" ]; then
+    stop_daemon_pid "$daemon_pid"
+    fail "away daemon did not establish a hosted watcher before unreclaimable drift test; stderr=$(cat "$daemon_err" 2>/dev/null); log=$(cat "$state/.supervise-daemon.log" 2>/dev/null)"
+  fi
+
+  sleep 60 &
+  foreign_pid=$!
+  foreign_identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$ROOT/bin/fm-wake-lib.sh" "$foreign_pid") || {
+    stop_daemon_pid "$daemon_pid"
+    kill "$foreign_pid" 2>/dev/null || true
+    wait "$foreign_pid" 2>/dev/null || true
+    fail "could not identify foreign watcher holder"
+  }
+  mkdir -p "$state/.watch.lock"
+  printf '%s\n' "$foreign_pid" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir/other-home" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$foreign_identity" > "$state/.watch.lock/pid-identity"
+
+  if ! wait_for_file_contains "$state/.supervise-daemon.log" "live watcher pid $foreign_pid held mismatched lock" 120; then
+    stop_daemon_pid "$daemon_pid"
+    kill "$foreign_pid" 2>/dev/null || true
+    wait "$foreign_pid" 2>/dev/null || true
+    fail "away daemon did not log unreclaimable runtime watcher ownership drift: $(cat "$state/.supervise-daemon.log" 2>/dev/null)"
+  fi
+  kill -0 "$daemon_pid" 2>/dev/null || {
+    kill "$foreign_pid" 2>/dev/null || true
+    wait "$foreign_pid" 2>/dev/null || true
+    fail "away daemon exited instead of staying alive to retry unreclaimable ownership drift"
+  }
+  grep -F "away-mode daemon lost watcher ownership" "$state/.subsuper-escalations" >/dev/null \
+    || grep -F "away-mode daemon lost watcher ownership" "$sent" >/dev/null \
+    || fail "away daemon did not buffer or inject an ownership-loss escalation: buffer=$(cat "$state/.subsuper-escalations" 2>/dev/null); sent=$(cat "$sent" 2>/dev/null)"
+  if ! wait_for_file_contains "$state/.supervise-daemon.log" "suppressing duplicate" 120; then
+    stop_daemon_pid "$daemon_pid"
+    kill "$foreign_pid" 2>/dev/null || true
+    wait "$foreign_pid" 2>/dev/null || true
+    fail "away daemon did not retry far enough to exercise ownership-loss throttle: $(cat "$state/.supervise-daemon.log" 2>/dev/null)"
+  fi
+  [ "$(grep -c 'Supervisor escalate' "$sent" 2>/dev/null | tr -d ' ')" -eq 1 ] \
+    || fail "away daemon injected duplicate ownership-loss escalations within the throttle window: $(cat "$sent" 2>/dev/null)"
+  stop_daemon_pid "$daemon_pid"
+  kill "$foreign_pid" 2>/dev/null || true
+  wait "$foreign_pid" 2>/dev/null || true
+  pass "away-mode daemon keeps retrying and buffers escalation on unreclaimable runtime watcher drift"
+}
+
+test_away_mode_refuses_mismatched_live_watcher_lock() {
+  local dir state fakebin out err lock_pid identity status
+  dir=$(make_supercase away-mode-mismatched-watch-lock)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/daemon.out"
+  err="$dir/daemon.err"
+
+  sleep 60 &
+  lock_pid=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$ROOT/bin/fm-wake-lib.sh" "$lock_pid") || {
+    kill "$lock_pid" 2>/dev/null || true
+    wait "$lock_pid" 2>/dev/null || true
+    fail "could not identify mismatched watcher holder"
+  }
+  mkdir -p "$state/.watch.lock"
+  printf '%s\n' "$lock_pid" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir/other-home" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+
+  afk_enter "$state"
+  status=0
+  PATH="$fakebin:$PATH" \
+    FM_STATE_OVERRIDE="$state" \
+    FM_SUPERVISOR_BACKEND=tmux \
+    FM_SUPERVISOR_TARGET=fakepane \
+    FM_FAKE_TMUX_PANE_ALIVE=1 \
+    "$DAEMON" --away-mode >"$out" 2>"$err" || status=$?
+  kill "$lock_pid" 2>/dev/null || true
+  wait "$lock_pid" 2>/dev/null || true
+
+  [ "$status" -ne 0 ] || fail "away-mode daemon reported success behind a mismatched live watcher lock"
+  grep -F 'does not match this home/path' "$err" >/dev/null \
+    || fail "away-mode daemon did not explain the mismatched watcher lock: $(cat "$err" 2>/dev/null)"
+  [ ! -e "$state/.supervise-daemon.mode" ] \
+    || fail "away-mode daemon wrote readiness mode despite mismatched watcher lock"
+  pass "away-mode daemon refuses a mismatched live watcher lock before readiness"
+}
+
+test_away_mode_readiness_waits_for_startup_validation() {
+  local dir state out err status
+  dir=$(make_supercase away-mode-ready-fail)
+  state="$dir/state"
+  out="$dir/daemon.out"
+  err="$dir/daemon.err"
+
+  FM_STATE_OVERRIDE="$state" \
+    FM_SUPERVISOR_BACKEND=orca \
+    "$DAEMON" --away-mode >"$out" 2>"$err"
+  status=$?
+
+  [ "$status" -ne 0 ] || fail "away-mode daemon accepted an unsupported supervisor backend"
+  grep -F "does not support supervisor backend 'orca'" "$err" >/dev/null \
+    || fail "away-mode daemon did not report the unsupported supervisor backend: $(cat "$err" 2>/dev/null)"
+  [ ! -e "$state/.supervise-daemon.mode" ] \
+    || fail "away-mode daemon wrote a ready mode file before startup validation succeeded"
+  [ ! -e "$state/.supervise-daemon.pid" ] \
+    || fail "away-mode daemon left a pidfile after startup validation failed"
+  [ ! -e "$state/.supervise-daemon.lock" ] \
+    || fail "away-mode daemon left its singleton lock after startup validation failed"
+  pass "away-mode daemon writes no ready mode file before startup validation succeeds"
 }
 
 test_away_mode_flag_keeps_daemon_injection_path() {
@@ -1957,4 +2465,13 @@ test_inject_msg_herdr_pane_gone_defers
 test_inject_msg_herdr_submits_through_backend_dispatch
 test_inject_msg_defers_on_dead_shell_unknown
 test_neutral_host_default_queues_without_away_side_effects
+test_neutral_host_respawns_watcher_between_wakes
+test_neutral_host_ignores_afk_without_away_mode
+test_default_neutral_refuses_afk_without_explicit_host_flag
+test_false_env_neutral_allows_explicit_afk_hosting
+test_away_mode_takes_over_existing_plain_watcher
+test_away_mode_reclaims_runtime_watcher_lock_drift
+test_away_mode_retries_unreclaimable_runtime_watcher_lock_drift
+test_away_mode_refuses_mismatched_live_watcher_lock
+test_away_mode_readiness_waits_for_startup_validation
 test_away_mode_flag_keeps_daemon_injection_path

@@ -62,11 +62,16 @@ Pi and OpenCode verify session-lock ownership and launch one singleton successor
 Claude keeps its tracked background-task protocol and adds a narrow PreToolUse continuity gate that allows drain, arm recovery, and fail-closed teardown while refusing only other fleet commands when tasks are in flight and no identity-matched live watcher holds the home lock.
 The existing turn-end guard is unchanged and remains the final backstop for all five harness protocols.
 Its `--restart` mode signals only the watcher recorded in the current home's `state/.watch.lock`, so restarting one home cannot kill sibling secondmate watchers.
-For homes that need a reaper-surviving watcher host instead of a one-cycle tracked child, start `bin/fm-supervise-daemon.sh` with no flags.
-That default neutral-host mode keeps respawning one-shot `bin/fm-watch.sh` children under the daemon's lock, pidfile, crash backoff, and log, but it leaves every wake record and suppression marker to the watcher itself.
-While the neutral host is running it supersedes the plain `bin/fm-watch-arm.sh` re-arm loop for watcher liveness in that home; `fm-watch-arm.sh` remains valid and coherent because it verifies the same `state/.watch.lock` and fresh `state/.last-watcher-beat` rather than assuming it launched the watcher.
+For homes that need a reaper-surviving watcher host instead of a one-cycle tracked child, start `bin/fm-supervise-daemon.sh --neutral-host`.
+That default neutral-host mode keeps respawning `bin/fm-watch.sh` children under the daemon's lock, pidfile, crash backoff, and log, but it leaves every wake record and suppression marker to the watcher itself.
+If `state/.afk` exists, the no-flag default refuses and `--neutral-host` is the explicit override for deliberately neutral behavior.
+While the neutral host is running it can supersede the plain `bin/fm-watch-arm.sh` re-arm loop for watcher liveness in that home; it does not provide the harness background-task completion that normally wakes firstmate to drain queued records.
+Use it only where another turn, guard, or explicit poll path will consume `state/.wake-queue`; `fm-watch-arm.sh` remains the default when immediate firstmate wake delivery is required.
+`fm-watch-arm.sh` remains valid and coherent because it verifies the same `state/.watch.lock` and fresh `state/.last-watcher-beat` rather than assuming it launched the watcher.
+When the lock belongs to a daemon child, it reports `watcher: hosted-by-daemon ...` instead of `watcher: healthy ...`; neutral-host ownership exits non-zero because the arm did not create harness wake delivery.
+When a live away daemon owns catch-up but a plain arm cannot confirm a watcher, it reports `watcher: daemon-owned mode=away ...` instead of the generic failed status.
 Do not run both as competing supervision strategies on purpose.
-If a neutral-hosted watcher fires, consume the durable records with the same `bin/fm-wake-drain.sh` path; the host has no injection pane and does no wake classification of its own.
+If a neutral-hosted watcher fires, consume the durable records with the same `bin/fm-wake-drain.sh` path; the host has no injection pane, sends no notification, and does no wake classification of its own.
 A pull-based guard (`bin/fm-guard.sh`) warns through supervision tool output if the primary checkout is tangled, or if tasks are in flight and that watcher stops running or queued wakes are waiting to be drained.
 The drain script calls that guard after emptying the queue, which avoids repeating the queued-wakes warning for records it just consumed while still warning on stale watcher liveness.
 It leads with a prominent bordered tangle banner, while `bin/fm-guard.sh` owns the stale-watcher banner/reminder policy so repeated guarded commands stay noisy without reprinting the full watcher-down banner in the same episode.
@@ -75,6 +80,7 @@ The guard covers the main primary and genuinely marked secondmate homes, exempts
 
 The same daemon becomes the walk-away sub-supervisor only when launched with `--away-mode` or `FM_SUPERVISE_AWAY_MODE=1`.
 The `/afk` skill sets `state/.afk` and starts that opt-in away layer through the tracked foreground helper `bin/fm-afk-start.sh`, after which the watcher reverts to daemon-managed one-shot mode and the daemon self-handles routine wakes in bash.
+Away-mode startup stops this home's existing plain watcher, if one already owns `state/.watch.lock`, before launching the explicit away-mode watcher child.
 The watcher and daemon share `bin/fm-classify-lib.sh` for captain-relevant status verbs, declared-external-wait vocabulary, and status-scan primitives.
 Terminal verbs remain captain-relevant, while a nonterminal progress verb cannot become terminal merely because its prose contains a legacy free-text token such as `merged`; bare legacy free-text lines remain compatible.
 The always-on watcher also uses that library's absorb classification on no-verb signals and first-sighting stale panes before status-log terminality is trusted, while the daemon maintains distinct away-mode wedge and declared-pause recheck cadences.

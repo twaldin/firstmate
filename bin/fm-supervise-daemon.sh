@@ -13,10 +13,16 @@
 # The hosted watcher remains the sole owner of durable wake queueing and
 # suppression markers, so the normal fm-wake-drain.sh consumption contract stays
 # unchanged.
+# Neutral host mode is a liveness-only primitive, started directly by homes that
+# deliberately choose it.
+# If state/.afk already exists, the no-flag default refuses to start so stale
+# away-mode launchers cannot silently downgrade supervision; pass --neutral-host
+# or FM_SUPERVISE_AWAY_MODE=0 to force neutral behavior explicitly.
 #
 # AWAY MODE: explicit opt-in layer.
 # Pass --away-mode, or set FM_SUPERVISE_AWAY_MODE=1, only from an away-mode
-# launcher such as the /afk skill after it has set state/.afk.
+# launcher such as bin/fm-afk-start.sh, which writes state/.afk only after this
+# daemon has passed startup validation.
 # With that opt-in, this script preserves the historical away-mode behavior:
 # it wraps bin/fm-watch.sh, classifies each one-shot wake reason, self-handles
 # the routine majority in bash, and escalates a batched, distilled digest to the
@@ -62,12 +68,13 @@
 #
 # The robustness shell from the prior always-inject version is preserved:
 # single-instance lock (portable helper, no flock dependency), crash-loop
-# backoff, pane-gone guard, and a signal-trapped shutdown that flushes buffered
-# escalations before exit.
+# backoff, injection target guard, and a signal-trapped shutdown that flushes
+# buffered escalations before exit.
 #
 # Usage:
 #          fm-supervise-daemon.sh
-#              Neutral watcher-host mode, the default.
+#              Neutral watcher-host mode, the default; refuses when state/.afk
+#              exists unless neutral mode is explicit.
 #          fm-supervise-daemon.sh --away-mode
 #              Enable the away-mode classifier, batching, injection, stale
 #              backstop, max-defer alarm, and state/.subsuper-* buffering.
@@ -75,7 +82,7 @@
 #              Environment equivalent used by launchers that cannot pass flags.
 #          fm-supervise-daemon.sh --neutral-host
 #              Explicitly force the default neutral host, overriding
-#              FM_SUPERVISE_AWAY_MODE.
+#              FM_SUPERVISE_AWAY_MODE and the state/.afk default-launch guard.
 #          fm-supervise-daemon.sh --help
 #              Print current flags and environment knobs.
 #
@@ -87,6 +94,8 @@
 #          FM_STATE_OVERRIDE        alternate state dir (testing).
 #
 # Env knobs read only in --away-mode:
+#          FM_WATCHER_AWAY_MODE    internal child env set by this daemon when
+#                                   --away-mode is active.
 #          FM_SUPERVISOR_TARGET     supervisor pane target override.
 #          FM_SUPERVISOR_BACKEND    supervisor pane backend override (tmux|herdr).
 #          FM_INJECT_SKIP           |-prefixes force-self-handle bypassing
@@ -131,16 +140,20 @@
 #                                   (default 3).
 #          FM_INJECT_CONFIRM_SLEEP  seconds between daemon submit checks
 #                                   (default 0.5).
-#          FM_INJECT_FAIL_SLEEP     seconds to back off while the supervisor
-#                                   target is unavailable (default 30).
+#          FM_INJECT_FAIL_SLEEP     seconds between target-gone log/backoff
+#                                   markers while buffered escalations wait.
 #
 # Logs each wake to state/.supervise-daemon.log (size-capped). Single instance
-# via portable lock on state/.supervise-daemon.lock. The current mode is written
-# to state/.supervise-daemon.mode while the process is alive so /afk can replace
-# a neutral host with an away-mode daemon. Trapped SIGTERM/SIGINT shut down
-# within ~1s, release the lock, and flush buffered escalations only in away
-# mode. A crashing fm-watch.sh is logged and restarted, never killing the daemon;
-# a tight crash-restart spin is detected and backed off.
+# via portable lock on state/.supervise-daemon.lock. The current mode and pid
+# identity are written to state/.supervise-daemon.mode and
+# state/.supervise-daemon.pid-identity only after startup validation succeeds so
+# /afk can replace a committed neutral host with an away-mode daemon. Away-mode
+# startup also stops this home's existing plain watcher, if one already owns
+# state/.watch.lock, before launching the explicit away-mode watcher child.
+# Trapped SIGTERM/SIGINT shut down within ~1s, release the lock, and flush
+# buffered escalations only in away mode. A crashing fm-watch.sh is logged and
+# restarted, never killing the daemon; a tight crash-restart spin is detected
+# and backed off.
 set -u
 
 FM_DAEMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -202,9 +215,9 @@ WEDGE_ALARM_NOTIFIER_PID=
 # Composer-empty detection and the tmux busy-footer fallback live in
 # bin/fm-tmux-lib.sh (FM_TMUX_BUSY_REGEX_DEFAULT / fm_tmux_composer_state);
 # FM_BUSY_REGEX still overrides the fallback busy set here, as before.
-INJECT_FAIL_SLEEP_DEFAULT=30
 INJECT_CONFIRM_RETRIES_DEFAULT=3
 INJECT_CONFIRM_SLEEP_DEFAULT=0.5
+INJECT_FAIL_SLEEP_DEFAULT=30
 CRASH_THRESHOLD_DEFAULT=10
 CRASH_WINDOW_DEFAULT=60
 CRASH_BACKOFF_DEFAULT=60
@@ -614,10 +627,28 @@ stale_window_is_busy() {  # <window> <state>
 }
 
 escalate_add() {  # <state> <distilled-item>
-  local state=$1 item=$2 buf
+  local state=$1 item=$2 buf last max_item max_lines lines tmp
   buf="$state/.subsuper-escalations"
+  max_item=${FM_ESCALATE_ITEM_MAX_CHARS:-500}
+  max_lines=${FM_ESCALATE_BUFFER_MAX_LINES:-50}
+  case "$max_item" in ''|*[!0-9]*) max_item=500 ;; esac
+  case "$max_lines" in ''|*[!0-9]*) max_lines=50 ;; esac
+  [ "$max_item" -gt 0 ] || max_item=500
+  [ "$max_lines" -gt 0 ] || max_lines=50
+  item=$(printf '%s\n' "$item" | awk -v max="$max_item" '{ if (length($0) > max) print substr($0, 1, max) "..."; else print }')
+  if [ -s "$buf" ]; then
+    last=$(tail -n 1 "$buf" 2>/dev/null || true)
+    [ "$last" = "$item" ] && return 0
+  fi
   [ -s "$buf" ] || _now > "${buf}.since"
   printf '%s\n' "$item" >> "$buf"
+  lines=$(wc -l < "$buf" 2>/dev/null || echo 0)
+  if [ "$lines" -gt "$max_lines" ]; then
+    tmp=$(mktemp "${TMPDIR:-/tmp}/fm-escalations.XXXXXX") || return 0
+    tail -n "$max_lines" "$buf" >"$tmp" 2>/dev/null && mv -f "$tmp" "$buf"
+    rm -f "$tmp" 2>/dev/null || true
+    _now > "${buf}.since"
+  fi
 }
 
 # Flush the escalation buffer as ONE batched, single-line digest to the
@@ -1095,7 +1126,7 @@ window_for_task() {  # <task-key> [state]
 #     line, or a previous injection's unsent text), defer entirely - injecting
 #     would merge with the human's text.
 inject_msg() {  # <message> [state]
-  local msg=$1 state target backend retries sleep_s verdict composer encoded
+  local msg=$1 state target backend retries sleep_s verdict composer encoded gone_marker fail_sleep
   state="${2:-$(_state_root)}"
   # (1) Presence-gate: inject ONLY when afk is active. When afk is off, the
   # daemon self-handles and stays quiet; firstmate drives the normal always-on
@@ -1115,8 +1146,17 @@ inject_msg() {  # <message> [state]
   # when unset (sourced/test contexts that never ran fm_super_main's startup
   # discovery), matching this function's pre-existing default assumption.
   backend="${FM_SUPERVISOR_BACKEND:-tmux}"
-  fm_backend_target_exists "$backend" "$target" || return 1
-  # (3) Busy-guard: never inject into an in-use pane.
+  if ! fm_backend_target_exists "$backend" "$target"; then
+    gone_marker="$state/.subsuper-target-gone"
+    fail_sleep=${FM_INJECT_FAIL_SLEEP:-$INJECT_FAIL_SLEEP_DEFAULT}
+    if [ "$(_file_age "$gone_marker")" -ge "$fail_sleep" ]; then
+      log "inject deferred: supervisor target '$target' missing (backend=$backend); watcher stays live and buffer is preserved"
+      _now > "$gone_marker"
+    fi
+    return 1
+  fi
+  rm -f "$state/.subsuper-target-gone" 2>/dev/null || true
+  # (3) Busy-guard: never inject into an in-use pane. Two checks:
   #   a) pane_is_busy: the harness shows a busy footer (agent mid-turn).
   if pane_is_busy "$target" "$backend"; then
     log "inject deferred: supervisor pane busy (agent mid-turn)"
@@ -1271,6 +1311,41 @@ trim_log() {
   tail -n "${FM_LOG_KEEP_LINES:-$LOG_KEEP_LINES_DEFAULT}" "$LOG" >"$tmp" 2>/dev/null && mv -f "$tmp" "$LOG"
 }
 
+fm_super_stop_existing_watcher_for_away() {  # <state> <watch-path> <home>
+  local state=$1 watch=$2 home=$3 lock pid i
+  lock="$state/.watch.lock"
+  pid=$(cat "$lock/pid" 2>/dev/null || true)
+  fm_pid_alive "$pid" || return 0
+  if ! fm_watcher_lock_matches_pid "$state" "$watch" "$pid" "$home"; then
+    echo "error: away-mode daemon found live watcher lock pid $pid that does not match this home/path; refusing split watcher ownership" >&2
+    log "startup failed: live watcher pid $pid held mismatched lock"
+    return 1
+  fi
+  log "away mode stopping existing watcher pid $pid before taking watcher ownership"
+  kill -TERM "$pid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 50 ] && fm_pid_alive "$pid"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if fm_pid_alive "$pid"; then
+    echo "error: away-mode daemon could not stop existing watcher pid $pid; refusing split watcher ownership" >&2
+    log "startup failed: existing watcher pid $pid did not exit"
+    return 1
+  fi
+  return 0
+}
+
+fm_super_away_reclaim_watcher_ownership() {  # <state> <watch-path> <home> [current-child-pid]
+  local state=$1 watch=$2 home=$3 current_child=${4:-} lock pid
+  lock="$state/.watch.lock"
+  pid=$(cat "$lock/pid" 2>/dev/null | tr -d '[:space:]' || true)
+  fm_pid_alive "$pid" || return 0
+  [ -n "$current_child" ] && [ "$pid" = "$current_child" ] && return 0
+  log "away mode reclaiming watcher ownership from pid $pid"
+  fm_super_stop_existing_watcher_for_away "$state" "$watch" "$home"
+}
+
 # ============================================================================
 # Everything below runs only when the script is EXECUTED, not sourced. The pure
 # classifiers above are sourceable for unit tests (tests/fm-daemon.test.sh).
@@ -1288,6 +1363,12 @@ Modes:
       backoff, and child respawn loop only. No supervisor pane is discovered,
       no away-mode state is written, no wake is classified, no injection is
       attempted, and no state/.subsuper-* files are touched.
+      This is a liveness-only primitive: it does not create harness background
+      wake delivery, so guards warn while work is in flight unless another
+      explicit path drains state/.wake-queue.
+      When state/.afk exists, pass this flag or FM_SUPERVISE_AWAY_MODE=0
+      explicitly; a no-flag neutral default refuses to avoid stale away-mode
+      launchers silently downgrading supervision.
 
   --away-mode
       Opt into the /afk sub-supervisor layer. The daemon discovers the
@@ -1298,7 +1379,8 @@ Modes:
 Environment:
   FM_SUPERVISE_AWAY_MODE=1
       Equivalent to --away-mode. Accepted true values: 1, true, yes, on, away.
-      Accepted false values: 0, false, no, off, neutral, or unset.
+      Accepted false values: 0, false, no, off, neutral; unset defaults to
+      neutral except it refuses while state/.afk exists.
 
   FM_STATE_OVERRIDE
       Alternate state directory for tests.
@@ -1319,11 +1401,14 @@ EOF
 }
 
 fm_super_main() {
-  local MODE arg
+  local MODE arg NEUTRAL_EXPLICIT=0
   MODE=neutral
   case "${FM_SUPERVISE_AWAY_MODE:-}" in
     1|true|TRUE|yes|YES|on|ON|away|AWAY) MODE=away ;;
-    ''|0|false|FALSE|no|NO|off|OFF|neutral|NEUTRAL) MODE=neutral ;;
+    '') MODE=neutral ;;
+    0|false|FALSE|no|NO|off|OFF|neutral|NEUTRAL)
+      MODE=neutral
+      NEUTRAL_EXPLICIT=1 ;;
     *)
       echo "error: invalid FM_SUPERVISE_AWAY_MODE='${FM_SUPERVISE_AWAY_MODE:-}' (use 1/true/on/away or 0/false/off/neutral)" >&2
       return 2 ;;
@@ -1336,7 +1421,8 @@ fm_super_main() {
         FM_SUPERVISE_AWAY_MODE=1 ;;
       --neutral-host|--host-only)
         MODE=neutral
-        FM_SUPERVISE_AWAY_MODE=0 ;;
+        FM_SUPERVISE_AWAY_MODE=0
+        NEUTRAL_EXPLICIT=1 ;;
       -h|--help)
         fm_super_usage
         return 0 ;;
@@ -1363,8 +1449,9 @@ fm_super_main() {
   local LOCK="$STATE/.supervise-daemon.lock"
   local PIDFILE="$STATE/.supervise-daemon.pid"
   local MODEFILE="$STATE/.supervise-daemon.mode"
+  local IDENTITYFILE="$STATE/.supervise-daemon.pid-identity"
+  local WATCHER_PIDFILE="$STATE/.supervise-daemon.watcher.pid"
   local AWAY_MODE=0
-  local INJECT_FAIL_SLEEP=${FM_INJECT_FAIL_SLEEP:-$INJECT_FAIL_SLEEP_DEFAULT}
   local CRASH_THRESHOLD=${FM_CRASH_THRESHOLD:-$CRASH_THRESHOLD_DEFAULT}
   local CRASH_WINDOW=${FM_CRASH_WINDOW:-$CRASH_WINDOW_DEFAULT}
   local CRASH_BACKOFF=${FM_CRASH_BACKOFF:-$CRASH_BACKOFF_DEFAULT}
@@ -1373,6 +1460,12 @@ fm_super_main() {
   [ "$MODE" = away ] && AWAY_MODE=1
 
   [ -x "$WATCH" ] || { echo "error: watcher not found or not executable: $WATCH" >&2; exit 1; }
+
+  if [ "$AWAY_MODE" -eq 0 ] && [ "$NEUTRAL_EXPLICIT" -eq 0 ] && [ -e "$STATE/.afk" ]; then
+    echo "error: state/.afk exists; use --away-mode for away supervision or --neutral-host to force a neutral watcher host" >&2
+    log "startup failed: neutral default refused while state/.afk exists without explicit --neutral-host"
+    exit 1
+  fi
 
   # --- single instance (portable lock, no flock dependency) ------------------
   if ! fm_lock_try_acquire "$LOCK"; then
@@ -1384,8 +1477,7 @@ fm_super_main() {
     exit 1
   fi
   echo "$$" > "$PIDFILE"
-  fm_pid_identity "${BASHPID:-$$}" > "$LOCK/pid-identity" 2>/dev/null || true
-  printf '%s\n' "$MODE" > "$MODEFILE"
+  rm -f "$WATCHER_PIDFILE" 2>/dev/null || true
 
   if [ "$AWAY_MODE" -eq 1 ]; then
     # --- auto-discover the supervisor BACKEND (tmux vs herdr) first ---------
@@ -1415,6 +1507,7 @@ fm_super_main() {
       fm_lock_release "$LOCK" 2>/dev/null || true
       rm -f "$PIDFILE" 2>/dev/null || true
       rm -f "$MODEFILE" 2>/dev/null || true
+      rm -f "$IDENTITYFILE" 2>/dev/null || true
       exit 1
     fi
 
@@ -1445,9 +1538,21 @@ fm_super_main() {
       fm_lock_release "$LOCK" 2>/dev/null || true
       rm -f "$PIDFILE" 2>/dev/null || true
       rm -f "$MODEFILE" 2>/dev/null || true
+      rm -f "$IDENTITYFILE" 2>/dev/null || true
+      exit 1
+    fi
+
+    if ! fm_super_stop_existing_watcher_for_away "$STATE" "$WATCH" "$FM_HOME"; then
+      fm_lock_release "$LOCK" 2>/dev/null || true
+      rm -f "$PIDFILE" 2>/dev/null || true
+      rm -f "$MODEFILE" 2>/dev/null || true
+      rm -f "$IDENTITYFILE" 2>/dev/null || true
       exit 1
     fi
   fi
+
+  fm_pid_identity "$$" > "$IDENTITYFILE"
+  printf '%s\n' "$MODE" > "$MODEFILE"
 
   if [ "$AWAY_MODE" -eq 1 ]; then
     local afk_status="off"
@@ -1455,11 +1560,15 @@ fm_super_main() {
     log "daemon starting (pid $$); mode=away; target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
     migrate_watcher_pause_markers "$STATE"
   else
+    if [ -e "$STATE/.afk" ]; then
+      echo "warn: neutral watcher host started while state/.afk exists; use --away-mode for away supervision" >&2
+      log "WARNING: neutral host active while state/.afk exists; away behavior remains off"
+    fi
     log "daemon starting (pid $$); mode=neutral-host; watcher=$WATCH; away_behavior=off"
   fi
 
   # --- shutdown: flush buffered escalations, reap child, release lock -------
-  local WATCHER_PID="" CUR_TMP=""
+  local WATCHER_PID="" CUR_TMP="" EXIT_STATUS=0
   cleanup() {
     trap - TERM INT
     if [ "$AWAY_MODE" -eq 1 ]; then
@@ -1476,8 +1585,35 @@ fm_super_main() {
     fm_lock_release "$LOCK" 2>/dev/null || true
     rm -f "$PIDFILE" 2>/dev/null || true
     rm -f "$MODEFILE" 2>/dev/null || true
+    rm -f "$IDENTITYFILE" 2>/dev/null || true
+    rm -f "$WATCHER_PIDFILE" 2>/dev/null || true
     log "daemon shutting down"
-    exit 0
+    exit "$EXIT_STATUS"
+  }
+  away_lost_ownership_retry() {
+    local detail=$1 marker window age
+    marker="$STATE/.subsuper-ownership-lost"
+    window=${FM_MAX_DEFER_SECS:-$MAX_DEFER_SECS_DEFAULT}
+    case "$window" in
+      ''|*[!0-9]*) window=$MAX_DEFER_SECS_DEFAULT ;;
+    esac
+    [ "$window" -gt 0 ] || window=$MAX_DEFER_SECS_DEFAULT
+    echo "error: away-mode daemon lost watcher ownership; keeping daemon alive to retry reclaim" >&2
+    log "ERROR: $detail"
+    age=$(_file_age "$marker")
+    if [ "$age" -ge "$window" ]; then
+      _now > "$marker"
+      escalate_add "$STATE" "away-mode daemon lost watcher ownership: $detail; delivery is blocked until reclaim succeeds"
+    else
+      log "ownership-loss escalation already buffered ${age}s ago; suppressing duplicate"
+    fi
+    trim_log
+  }
+  away_ownership_recovered() {
+    if [ -e "$STATE/.subsuper-ownership-lost" ]; then
+      rm -f "$STATE/.subsuper-ownership-lost" 2>/dev/null || true
+      log "away watcher ownership recovered; duplicate ownership-loss throttle cleared"
+    fi
   }
   trap cleanup TERM INT
 
@@ -1503,26 +1639,17 @@ fm_super_main() {
 
   start_watcher() {
     CUR_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-watch.XXXXXX") || { log "error: mktemp failed; retrying in 5s"; sleep 5; return 1; }
-    "$WATCH" >"$CUR_TMP" 2>>"$WATCH_ERR" &
+    if [ "$AWAY_MODE" -eq 1 ]; then
+      FM_WATCHER_AWAY_MODE=1 "$WATCH" >"$CUR_TMP" 2>>"$WATCH_ERR" &
+    else
+      FM_WATCHER_AWAY_MODE=0 "$WATCH" >"$CUR_TMP" 2>>"$WATCH_ERR" &
+    fi
     WATCHER_PID=$!
+    printf '%s\n' "$WATCHER_PID" > "$WATCHER_PIDFILE" 2>/dev/null || true
   }
 
-  local rc reason
+  local rc reason lock_pid
   while true; do
-    # --- pane-gone guard (preserved) ---------------------------------------
-    # With the #29 watcher's enqueue-before-suppress, a wake is no longer
-    # swallowed by running the watcher with no injection target. We still back
-    # off while the pane is gone: self-handling needs no pane, but escalation
-    # has nowhere to go, and firstmate itself is the consumer of escalations.
-    # Catch-up signals persist in state/*.status and flow on the next run, so
-    # this delays rather than loses work.
-    if [ "$AWAY_MODE" -eq 1 ] && ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
-      log "warn: supervisor target '$TARGET' gone; backing off ${INJECT_FAIL_SLEEP}s, will retry"
-      # Flush is pointless with no pane; preserve any buffered escalations.
-      sleep "$INJECT_FAIL_SLEEP"
-      continue
-    fi
-
     # --- (re)start watcher if it has exited --------------------------------
     if [ -z "${WATCHER_PID:-}" ] || ! kill -0 "${WATCHER_PID:-}" 2>/dev/null; then
       if [ -n "${WATCHER_PID:-}" ]; then
@@ -1536,10 +1663,27 @@ fm_super_main() {
           rm -f "${CUR_TMP}" 2>/dev/null || true
         fi
         CUR_TMP=""
+        rm -f "$WATCHER_PIDFILE" 2>/dev/null || true
         if [ "$rc" -ne 0 ] || [ -z "$reason" ]; then
+          if [ "$AWAY_MODE" -eq 1 ] && [ "$rc" -eq 0 ] && [ -z "$reason" ]; then
+            log "away watcher exited without a wake; rechecking watcher ownership"
+            record_crash
+            WATCHER_PID=""
+            if fm_super_away_reclaim_watcher_ownership "$STATE" "$WATCH" "$FM_HOME"; then
+              away_ownership_recovered
+              log "away watcher ownership recheck complete; restarting after ${backoff_secs}s"
+              trim_log
+              sleep "$backoff_secs"
+              continue
+            fi
+            away_lost_ownership_retry "lost watcher ownership after silent child exit"
+            sleep "$backoff_secs"
+            continue
+          fi
           record_crash
           log "watcher exited rc=$rc reason='$reason'; restarting after ${backoff_secs}s"
           WATCHER_PID=""
+          trim_log
           sleep "$backoff_secs"
           continue
         fi
@@ -1548,8 +1692,24 @@ fm_super_main() {
         # and a backoff-less child restart. record_crash is intentionally
         # skipped (rc=0, this is normal idle, not a crash).
         if ! is_wake_reason "$reason"; then
+          if [ "$AWAY_MODE" -eq 1 ]; then
+            log "away watcher non-wake stdout, rechecking ownership: $reason"
+            record_crash
+            WATCHER_PID=""
+            if fm_super_away_reclaim_watcher_ownership "$STATE" "$WATCH" "$FM_HOME"; then
+              away_ownership_recovered
+              log "away watcher ownership recheck complete; restarting after ${backoff_secs}s"
+              trim_log
+              sleep "$backoff_secs"
+              continue
+            fi
+            away_lost_ownership_retry "lost watcher ownership after non-wake stdout: $reason"
+            sleep "$backoff_secs"
+            continue
+          fi
           log "watcher non-wake stdout, idling: $reason"
           WATCHER_PID=""
+          trim_log
           sleep "${HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}"
           continue
         fi
@@ -1570,6 +1730,27 @@ fm_super_main() {
     # enough that batch flushes, stale rechecks, and the catch-all scan fire on
     # cadence. Gating keeps a large fleet cheap between ticks.
     sleep 1
+    if [ "$AWAY_MODE" -eq 1 ] && [ -n "${WATCHER_PID:-}" ] && fm_pid_alive "$WATCHER_PID"; then
+      lock_pid=$(cat "$STATE/.watch.lock/pid" 2>/dev/null | tr -d '[:space:]' || true)
+      if [ -n "$lock_pid" ] && [ "$lock_pid" != "$WATCHER_PID" ] && fm_pid_alive "$lock_pid"; then
+        log "away watcher lock drifted to pid $lock_pid while child $WATCHER_PID was live"
+        record_crash
+        kill "$WATCHER_PID" 2>/dev/null || true
+        wait "$WATCHER_PID" 2>/dev/null || true
+        WATCHER_PID=""
+        rm -f "$WATCHER_PIDFILE" 2>/dev/null || true
+        if fm_super_away_reclaim_watcher_ownership "$STATE" "$WATCH" "$FM_HOME"; then
+          away_ownership_recovered
+          log "away watcher ownership recheck complete; restarting after ${backoff_secs}s"
+          trim_log
+          sleep "$backoff_secs"
+          continue
+        fi
+        away_lost_ownership_retry "lost watcher ownership to pid $lock_pid"
+        sleep "$backoff_secs"
+        continue
+      fi
+    fi
     if [ "$AWAY_MODE" -eq 1 ] && [ "$(_file_age "$STATE/.subsuper-last-housekeep")" -ge "${FM_HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}" ]; then
       _now > "$STATE/.subsuper-last-housekeep"
       housekeeping "$STATE"

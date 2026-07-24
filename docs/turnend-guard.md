@@ -147,8 +147,28 @@ So the model was re-invoked solely by the background task's completion while idl
 This matches the harness tool contract that a `run_in_background` task "keeps running across turns and re-invokes you when it exits", and reproduces the 11s latency the task audit measured independently on the same harness version.
 No Herdr command was issued and no fleet state was touched; the experiment wrote only to the session scratchpad, which was discarded.
 
+## Daemon-Hosted Delivery Gaps
+
+`bin/fm-supervision-lib.sh` factors the exact "in-flight work exists, but no watcher has a fresh beacon" computation out of `bin/fm-guard.sh` into a shared function, `fm_supervision_unhealthy <state-dir> [grace-seconds]`.
+That remains the right predicate for the pull-based guard, where a brief gap after a wake fires should stay silent inside the grace window.
+It also exposes `fm_supervision_status` for callers that need the individual fields (in-flight count, beacon freshness/age, queued-wake pending) rather than just the boolean.
+
+`bin/fm-turnend-guard.sh` deliberately uses a sharper end-of-turn predicate.
+It first refuses any non-empty `state/.wake-queue` only when no live away daemon owns catch-up and no live foreign session lock owns the queue, because a daemon-hosted watcher can keep the liveness beacon healthy while queued wakes still need a lock-owning firstmate turn to drain them unless verified away ownership is active.
+A live away daemon means `state/.afk` exists, `state/.supervise-daemon.mode` is `away`, `state/.supervise-daemon.pid` is alive, and `state/.supervise-daemon.pid-identity` still matches that live process.
+For in-flight work, a daemon-hosted watcher is treated as a delivery gap unless that live away daemon predicate is true, so both neutral hosts and `mode=away` daemons without the `.afk` presence gate block the turn.
+The queue block is skipped for a live away daemon only while watcher supervision is still within beacon grace with no live lock holder, or has a live identity-matched watcher lock whose pid matches `state/.supervise-daemon.watcher.pid`.
+That sidecar is written by `bin/fm-supervise-daemon.sh` every time it starts an away watcher child, so a competing plain watcher cannot make away mode look healthy.
+If that beacon goes stale, the hook tells firstmate to inspect or restart away mode first, then permits `bin/fm-watch-arm.sh` only after the daemon is stopped or `/afk` is exited.
+The queue block is also skipped for lock-refused read-only sessions, because the lock holder owns those queued wakes.
+It uses the same live-harness predicate as `bin/fm-lock.sh`, so a dead or non-harness session-lock pid is treated as unowned and a restarted primary does not silently leave queued wakes undrained.
+It then uses `fm_supervision_status` to count in-flight tasks, then requires `fm_watcher_healthy <state-dir> <watch-path> [grace-seconds] [home]` from `bin/fm-wake-lib.sh`.
+That shared live-watcher check is the same one used by `bin/fm-watch-arm.sh`: the recorded `state/.watch.lock/pid` must name a live process, the lock's recorded home/path/pid-identity must match the current live pid, and `state/.last-watcher-beat` must still be within `FM_GUARD_GRACE`.
+For away mode, a just-exited watcher with a fresh leftover beacon is tolerated as the daemon's normal respawn gap; outside away mode, and for away mode after the beacon goes stale, a missing or stale live-watcher check blocks the Stop hook.
+When queued wakes and missing watcher liveness are both true, the hook emits one combined stop response so Claude's one-block-per-turn loop guard does not hide either remediation.
+
 ## Tests
 
-`tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping (including a secondmate's own home being guarded like the main primary while its child worktrees stay exempt), `FM_HOME` and `FM_STATE_OVERRIDE` precedence, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-open behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
+`tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping (including a secondmate's own home being guarded like the main primary while its child worktrees stay exempt), `FM_HOME` and `FM_STATE_OVERRIDE` precedence, daemon-hosted queue-delivery gaps, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-open behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
 The default behavior suite does not invoke live language-model harnesses.
 `FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` opts into the isolated interactive Pi regression recorded above.

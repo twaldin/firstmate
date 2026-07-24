@@ -25,6 +25,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 GRACE=${FM_GUARD_GRACE:-300}
+WATCH="$SCRIPT_DIR/fm-watch.sh"
 queue_pending=false
 READ_ONLY=${FM_GUARD_READ_ONLY:-0}
 case "$READ_ONLY" in 1|true|TRUE|yes|YES) READ_ONLY=1 ;; *) READ_ONLY=0 ;; esac
@@ -148,52 +149,83 @@ fm_supervision_status "$STATE" "$GRACE"
 in_flight=$FM_SUP_IN_FLIGHT
 watcher_fresh=$FM_SUP_WATCHER_FRESH
 beacon_desc=$FM_SUP_BEACON_DESC
+
+[ -s "$FM_WAKE_QUEUE" ] && queue_pending=true
+away_daemon_active=false
+away_supervision_healthy=false
+daemon_delivery_gap=false
+daemon_delivery_gap_mode=
+fm_away_daemon_owns_catchup "$STATE" && away_daemon_active=true
+if [ "$away_daemon_active" = true ] && fm_away_supervision_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" "$watcher_fresh"; then
+  away_supervision_healthy=true
+fi
+if fm_daemon_hosted_watcher_without_delivery "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
+  daemon_delivery_gap=true
+  daemon_delivery_gap_mode=$FM_DAEMON_HOSTED_WATCHER_MODE
+fi
+
+warn_queued_wakes() {
+  if [ "$READ_ONLY" -eq 1 ]; then
+    echo "WARNING: queued wakes pending - left untouched for the session holding the fleet lock." >&2
+  elif [ "$away_daemon_active" = true ]; then
+    echo "WARNING: queued wakes pending while away-mode watcher health is not verified - inspect state/.supervise-daemon.log and restart away mode; stop the daemon or exit /afk before falling back to bin/fm-watch-arm.sh." >&2
+  else
+    echo "WARNING: queued wakes pending - drain them with bin/fm-wake-drain.sh before anything else." >&2
+  fi
+}
+
 if [ "$in_flight" -eq 0 ]; then
-  # Leave the unhealthy state (no work riding on the watcher): clear so a later
-  # in-flight + stale combination is a fresh episode even if the beacon is still
-  # absent with the same key string.
-  [ "$READ_ONLY" -eq 1 ] || fm_guard_clear_stale_banner
+  if "$queue_pending" && { [ "$away_daemon_active" != true ] || [ "$away_supervision_healthy" != true ]; }; then
+    warn_queued_wakes
+  fi
   exit 0
 fi
 
-[ -s "$FM_WAKE_QUEUE" ] && queue_pending=true
-
 # No fresh watcher with tasks in flight is the dangerous state: emit a prominent,
-# bordered banner FIRST so it reads as an alarm, not a buried stderr line. Later
-# calls in the same episode get a one-line reminder only.
-if [ "$watcher_fresh" = false ]; then
+# bordered banner FIRST so it reads as an alarm, not a buried stderr line.
+if [ "$watcher_fresh" = false ] || [ "$daemon_delivery_gap" = true ]; then
   episode_key=$(fm_guard_stale_episode_key "$STATE")
   episode_key=${episode_key%$'\n'}
-  print_full_banner=0
+  print_full_banner=1
+  if [ "$daemon_delivery_gap" != true ]; then
+    print_full_banner=0
+    if [ "$READ_ONLY" -eq 1 ]; then
+      fm_guard_stale_banner_seen "$STATE" "$episode_key" || print_full_banner=1
+    elif fm_guard_claim_stale_banner "$STATE" "$episode_key"; then
+      print_full_banner=1
+    fi
+  fi
   if [ "$READ_ONLY" -eq 1 ]; then
-    fm_guard_stale_banner_seen "$STATE" "$episode_key" || print_full_banner=1
-  elif fm_guard_claim_stale_banner "$STATE" "$episode_key"; then
-    print_full_banner=1
+    fix='Watcher repair belongs to the session holding the fleet lock; do not drain or re-arm from this read-only session.'
+  elif [ "$daemon_delivery_gap" = true ]; then
+    fix='Stop the watcher host, or re-enter /afk if away mode should own delivery, then run bin/fm-watch-arm.sh as the harness-tracked background task (never a shell & that gets reaped).'
+  elif [ "$away_daemon_active" = true ]; then
+    fix='Away-mode daemon is live but watcher liveness is stale; inspect state/.supervise-daemon.log and restart away mode. Stop the daemon or exit /afk before falling back to bin/fm-watch-arm.sh.'
+  elif "$queue_pending"; then
+    fix='After draining queued wakes, re-arm the watcher: run bin/fm-watch-arm.sh as the harness-tracked background task (never a shell & that gets reaped).'
+  else
+    fix='Re-arm it NOW: run bin/fm-watch-arm.sh as the harness-tracked background task (never a shell & that gets reaped).'
   fi
   if [ "$print_full_banner" -eq 1 ]; then
-    afk=0
-    [ -e "$STATE/.afk" ] && afk=1
-    queue_arg=0
-    "$queue_pending" && queue_arg=1
-    x_mode=0
-    [ -f "$CONFIG/x-mode.env" ] && x_mode=1
-    fix=$("$SCRIPT_DIR/fm-supervision-instructions.sh" \
-      --read-only "$READ_ONLY" \
-      --afk "$afk" \
-      --x-mode "$x_mode" \
-      --queue-pending "$queue_arg" \
-      --repair-line 2>/dev/null || printf '%s\n' 'Repair missing watcher supervision according to the session-start operating block.')
     rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
     {
       printf '●%s\n' "$rule"
-      printf '●  WATCHER DOWN - SUPERVISION IS OFF\n'
-      printf '●  %s task(s) in flight, but no watcher has a fresh beacon (last beat: %s, grace %ss).\n' "$in_flight" "$beacon_desc" "$GRACE"
+      if [ "$daemon_delivery_gap" = true ]; then
+        printf '●  WATCHER HOSTED WITHOUT HARNESS WAKE DELIVERY\n'
+        printf '●  %s task(s) in flight, but the live watcher is daemon-hosted in mode=%s without verified away-mode ownership.\n' "$in_flight" "$daemon_delivery_gap_mode"
+      else
+        printf '●  WATCHER DOWN - SUPERVISION IS OFF\n'
+        printf '●  %s task(s) in flight, but no watcher has a fresh beacon (last beat: %s, grace %ss).\n' "$in_flight" "$beacon_desc" "$GRACE"
+      fi
       if [ "$READ_ONLY" -eq 1 ]; then
         printf '●  This read-only session should report the lapse, not repair it.\n'
+      elif [ "$daemon_delivery_gap" = true ]; then
+        printf '●  Stop the watcher host or restore verified /afk ownership before arming a harness-tracked watcher cycle.\n'
+      elif [ "$away_daemon_active" = true ]; then
+        printf '●  Away-mode watcher repair starts with the supervise daemon; use the plain watcher arm only after stopping the daemon or exiting /afk.\n'
       else
-        printf '●  Trust the emitted supervision protocol for this harness; do not use shell & for watcher repair.\n'
+        printf '●  Trust bin/fm-watch-arm.sh for the true state: it confirms a live watcher and a fresh beacon, or fails loudly.\n'
       fi
-      printf '●  %s\n' "$CONTINUE_LINE"
       printf '●  %s\n' "$fix"
       printf '●%s\n' "$rule"
     } >&2
@@ -210,11 +242,9 @@ fi
 # Queued wakes are an independent hazard; warn whenever they are pending, even if
 # a watcher is alive. Kept after the banner so the no-watcher alarm reads first.
 # Dedup of the watcher-down banner never suppresses this warning.
-if "$queue_pending"; then
-  if [ "$READ_ONLY" -eq 1 ]; then
-    echo "WARNING: queued wakes pending - left untouched for the session holding the fleet lock." >&2
-  else
-    echo "WARNING: queued wakes pending - drain them with bin/fm-wake-drain.sh before anything else." >&2
-  fi
+if "$queue_pending" && [ "$away_daemon_active" = true ] && [ "$away_supervision_healthy" = true ]; then
+  : # The live away daemon owns catch-up; do not tell firstmate to drain its queue.
+elif "$queue_pending"; then
+  warn_queued_wakes
 fi
 exit 0

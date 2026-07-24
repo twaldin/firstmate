@@ -51,10 +51,14 @@ batched digest rather than per-wake injections.
    The daemon is **presence-gated**: it injects escalations only while
    `state/.afk` exists, and stays quiet otherwise.
 
-3. **Do not separately arm `fm-watch.sh`.** The daemon manages the watcher as
-   its child; the singleton lock no-ops a stray arm harmlessly.
+2. **Do not separately arm `fm-watch.sh` while a verified away-mode daemon is live and its watcher beacon is fresh.**
+   The daemon manages the watcher as its child; a stray plain arm can take the singleton in non-away mode and starve daemon classification.
+   If a guard reports a stale away-mode watcher, restart away mode first.
+   Use `bin/fm-watch-arm.sh` only after stopping the daemon or exiting `/afk`.
 
-4. **Acknowledge** in `AGENTS.md` section 9 language: "Captain, away mode is active; I will batch routine updates and surface only decisions, failures, credentials, or review-ready work until you return."
+3. **Acknowledge** to the captain only after startup verification succeeds: the daemon will
+   self-handle routine wakes, escalate only captain-relevant events, and the
+   captain can exit by sending any real message.
 
 ## How to exit afk
 

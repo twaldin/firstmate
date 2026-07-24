@@ -95,8 +95,14 @@ The `config/backend` file is not inherited by secondmate homes.
 
 `bin/fm-supervise-daemon.sh` starts in neutral watcher-host mode unless `FM_SUPERVISE_AWAY_MODE=1` or `--away-mode` is set.
 Neutral mode keeps `bin/fm-watch.sh` alive with the daemon's lock, pidfile, crash backoff, and child respawn loop, but it does not resolve a supervisor pane and does not write `state/.subsuper-*`.
-Use it instead of the plain `bin/fm-watch-arm.sh` re-arm loop only when a home deliberately wants the reaper-surviving host; both paths share the same watcher lock and liveness beacon, so `fm-watch-arm.sh` remains an honest verifier.
+The durable `state/.afk` file is an away-mode presence gate, not the daemon's mode selector.
+When `state/.afk` exists, a no-flag neutral launch refuses so stale away-mode launchers cannot silently downgrade supervision.
+Start it directly with `bin/fm-supervise-daemon.sh --neutral-host`.
+Use it instead of the plain `bin/fm-watch-arm.sh` re-arm loop only when a home deliberately wants the reaper-surviving liveness host and has another path to notice and drain queued wakes.
+Neutral host mode does not provide harness background-task completion or injection.
+Both paths share the same watcher lock and liveness beacon, so `fm-watch-arm.sh` remains an honest verifier.
 The `/afk` sub-supervisor starts the same daemon with the explicit away-mode opt-in and injects escalation digests into firstmate's own pane independently of where new task endpoints are spawned.
+`bin/fm-afk-start.sh` owns `/afk` startup and writes `state/.afk` only after the away daemon is verified ready.
 It currently supports only `tmux` and `herdr` supervisor panes.
 Set `FM_SUPERVISOR_BACKEND=tmux|herdr` and `FM_SUPERVISOR_TARGET=<target>` to override both axes explicitly; for herdr the target is `"<session>:<pane-id>"`.
 Without overrides, backend detection uses `$TMUX_PANE` first, then `HERDR_ENV=1` with `HERDR_PANE_ID`, then falls back to `tmux`.
@@ -443,7 +449,7 @@ FM_SEND_SLEEP=0.4       # seconds between fm-send submit checks
 FM_SEND_SETTLE=1        # seconds fm-send waits after a successful text submit; 0 disables
 FM_PENDING_REPLY_GRACE_SECS=120   # seconds after marked-request delivery before a completed turn without a correlated parent report is eligible for its one recovery repost
 # watcher host and away-mode sub-supervisor (bin/fm-supervise-daemon.sh)
-FM_SUPERVISE_AWAY_MODE=0           # 1/true/on/away opts into /afk classification, injection, and housekeeping; unset/0 leaves neutral watcher-host mode
+FM_SUPERVISE_AWAY_MODE=0           # 1/true/on/away opts into /afk classification, injection, and housekeeping; explicit 0/false/off/neutral forces neutral watcher-host mode, while unset refuses under state/.afk
 FM_SUPERVISOR_BACKEND=             # optional supervisor pane backend override; tmux/herdr only, otherwise detects $TMUX_PANE then HERDR_ENV/HERDR_PANE_ID before tmux fallback
 FM_SUPERVISOR_TARGET=              # optional supervisor pane target override; tmux target or herdr <session>:<pane-id>, otherwise auto-detected
 FM_INJECT_SKIP=heartbeat           # |-prefixes force-self-handled bypassing classification; empty disables
@@ -452,9 +458,9 @@ FM_MAX_DEFER_SECS=300              # max buffered escalation age before retry pl
 FM_WEDGE_ALARM_CHANNEL=            # override config/wedge-alarm with one active-alert directive for the wedge alarm; off|auto|osascript|herdr|command:<cmd>; absent = auto (macOS -> an OS notification)
 FM_WEDGE_ALARM_EXEC=              # notifier seam: route every channel (osascript, herdr, command:) through this command as `<cmd> <channel> <summary>`; "discard" fires nothing; unset in production; the daemon defaults it to "discard" when sourced so no test posts a real notification (docs/wedge-alarm.md)
 FM_WEDGE_ALARM_TIMEOUT_SECS=10    # maximum seconds for each osascript, herdr, override, or command: notifier before its watchdog terminates it and continues to the next channel; invalid or zero values use 10
-FM_INJECT_FAIL_SLEEP=30            # seconds to back off when the supervisor pane is unavailable
 FM_INJECT_CONFIRM_RETRIES=3        # daemon Enter-retry attempts after typing a digest once
 FM_INJECT_CONFIRM_SLEEP=0.5        # seconds between daemon submit checks
+FM_INJECT_FAIL_SLEEP=30            # seconds between target-gone log/backoff markers while buffered escalations wait
 FM_HEARTBEAT_SCAN_SECS=300         # cadence of the catch-all status scan for missed captain verbs
 FM_HOUSEKEEPING_TICK=15            # seconds between batch-flush, stale/pause-recheck, and scan passes
 FM_CRASH_THRESHOLD=10              # watcher crashes allowed inside FM_CRASH_WINDOW before daemon backoff

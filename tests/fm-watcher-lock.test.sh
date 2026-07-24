@@ -22,6 +22,30 @@ mark_pr_check_migration_complete() {
   chmod 0600 "$state/.pr-check-migration-scan-v1" "$state/.pr-check-migration-v1"
 }
 
+pid_identity() {
+  local state=$1 pid=$2
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$pid"
+}
+
+record_away_daemon() {
+  local state=$1 pid=$2 identity
+  identity=$(pid_identity "$state" "$pid") || fail "could not identify away daemon pid"
+  date '+%s' > "$state/.afk"
+  printf '%s\n' "$pid" > "$state/.supervise-daemon.pid"
+  printf '%s\n' "$identity" > "$state/.supervise-daemon.pid-identity"
+  printf 'away\n' > "$state/.supervise-daemon.mode"
+}
+
+record_watcher_lock() {
+  local dir=$1 state=$2 pid=$3 identity=$4 root bin_dir
+  root=$(cd "$dir" && pwd)
+  bin_dir=$(cd "$ROOT/bin" && pwd)
+  mkdir -p "$state/.watch.lock"
+  printf '%s\n' "$pid" > "$state/.watch.lock/pid"
+  printf '%s\n' "$root" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$bin_dir/fm-watch.sh" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+}
 
 test_singleton_start() {
   local dir state fakebin out1 out2 pid1 pid2 live i
@@ -167,6 +191,217 @@ test_guard_warnings() {
   FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || fail "guard failed"
   [ ! -s "$err" ] || fail "guard warned with a fresh watcher and no queued wakes: $(cat "$err")"
   pass "guard banner leads when down with pending wakes (repair-after-drain) and stays silent when fresh"
+}
+
+test_guard_warns_queued_wakes_without_inflight() {
+  local dir state err
+  dir=$(make_case guard-queue-idle)
+  state="$dir/state"
+  err="$dir/guard.err"
+  append_wake "$state" heartbeat heartbeat heartbeat || fail "guard idle heartbeat append failed"
+  FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || fail "guard failed"
+  grep -F 'queued wakes pending - drain them with bin/fm-wake-drain.sh' "$err" >/dev/null \
+    || fail "guard did not warn about queued wakes with no in-flight tasks: $(cat "$err")"
+  ! grep -F 'WATCHER DOWN' "$err" >/dev/null \
+    || fail "guard printed a watcher-down banner with no in-flight tasks: $(cat "$err")"
+  pass "fm-guard: queued wakes warn even when no task meta remains"
+}
+
+test_guard_away_daemon_owns_fresh_queue() {
+  local dir home state err daemon_pid watcher_pid watcher_identity
+  dir=$(make_case guard-away-fresh)
+  home=$(cd "$dir" && pwd)
+  state="$dir/state"
+  err="$dir/guard.err"
+  printf 'project=x\n' > "$state/task.meta"
+  append_wake "$state" heartbeat heartbeat heartbeat || fail "guard away heartbeat append failed"
+  sleep 60 &
+  daemon_pid=$!
+  record_away_daemon "$state" "$daemon_pid"
+  sleep 60 &
+  watcher_pid=$!
+  watcher_identity=$(pid_identity "$state" "$watcher_pid") || {
+    kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "could not identify away watcher pid"
+  }
+  record_watcher_lock "$dir" "$state" "$watcher_pid" "$watcher_identity"
+  printf '%s\n' "$watcher_pid" > "$state/.supervise-daemon.watcher.pid"
+  touch "$state/.last-watcher-beat"
+  FM_ROOT_OVERRIDE="$home" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || {
+    kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "guard failed"
+  }
+  kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  [ ! -s "$err" ] || fail "guard warned while live away daemon and healthy watcher owned queue: $(cat "$err")"
+  pass "fm-guard: live away daemon with healthy watcher owns queued catch-up without drain/re-arm warnings"
+}
+
+test_guard_away_daemon_tolerates_fresh_respawn_gap() {
+  local dir state err pid
+  dir=$(make_case guard-away-respawn-gap)
+  state="$dir/state"
+  err="$dir/guard.err"
+  append_wake "$state" heartbeat heartbeat heartbeat || fail "guard away respawn heartbeat append failed"
+  sleep 60 &
+  pid=$!
+  record_away_daemon "$state" "$pid"
+  touch "$state/.last-watcher-beat"
+  FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "guard failed"
+  }
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ ! -s "$err" ] || fail "guard warned during an away respawn gap with a fresh beacon: $(cat "$err")"
+  pass "fm-guard: live away daemon tolerates one-shot watcher respawn gaps within beacon grace"
+}
+
+test_guard_away_daemon_warns_on_foreign_watcher_lock() {
+  local dir state err daemon_pid watcher_pid watcher_identity
+  dir=$(make_case guard-away-foreign-watch)
+  state="$dir/state"
+  err="$dir/guard.err"
+  append_wake "$state" heartbeat heartbeat heartbeat || fail "guard away foreign heartbeat append failed"
+  sleep 60 &
+  daemon_pid=$!
+  record_away_daemon "$state" "$daemon_pid"
+  sleep 60 &
+  watcher_pid=$!
+  watcher_identity=$(pid_identity "$state" "$watcher_pid") || {
+    kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "could not identify foreign watcher pid"
+  }
+  record_watcher_lock "$dir" "$state" "$watcher_pid" "$watcher_identity"
+  touch "$state/.last-watcher-beat"
+  FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || {
+    kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "guard failed"
+  }
+  kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  grep -F 'queued wakes pending while away-mode watcher health is not verified' "$err" >/dev/null \
+    || fail "guard did not warn when a foreign watcher held the away lock: $(cat "$err")"
+  pass "fm-guard: live away daemon warns when a foreign watcher owns the lock"
+}
+
+test_guard_warns_on_neutral_daemon_hosted_watcher() {
+  local dir state err daemon_pid i watcher_pid
+  dir=$(make_case guard-neutral-hosted-watch)
+  state="$dir/state"
+  err="$dir/guard.err"
+  printf 'project=x\n' > "$state/task.meta"
+  FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=999999 FM_HEARTBEAT=999999999 FM_CHECK_INTERVAL=999999 "$ROOT/bin/fm-supervise-daemon.sh" --neutral-host >/dev/null 2>"$dir/daemon.err" &
+  daemon_pid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    watcher_pid=$(cat "$state/.supervise-daemon.watcher.pid" 2>/dev/null || true)
+    [ -n "$watcher_pid" ] && [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$watcher_pid" ] && [ -e "$state/.last-watcher-beat" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [ -z "${watcher_pid:-}" ] || [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" != "$watcher_pid" ]; then
+    kill "$daemon_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    fail "neutral host did not establish a hosted watcher for guard test: $(cat "$dir/daemon.err" 2>/dev/null)"
+  fi
+  FM_HOME="$dir" FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || {
+    kill "$daemon_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    fail "guard failed"
+  }
+  kill "$daemon_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  grep -F 'WATCHER HOSTED WITHOUT HARNESS WAKE DELIVERY' "$err" >/dev/null \
+    || fail "guard did not warn on neutral daemon-hosted watcher: $(cat "$err")"
+  grep -F 'Stop the watcher host' "$err" >/dev/null \
+    || fail "guard did not explain neutral daemon-hosted repair: $(cat "$err")"
+  pass "fm-guard: neutral daemon-hosted watcher warns when work is in flight"
+}
+
+test_guard_warns_on_away_daemon_hosted_watcher_without_afk() {
+  local dir home state err daemon_pid watcher_pid watcher_identity daemon_identity
+  dir=$(make_case guard-away-hosted-noafk)
+  home=$(cd "$dir" && pwd)
+  state="$dir/state"
+  err="$dir/guard.err"
+  printf 'project=x\n' > "$state/task.meta"
+  sleep 60 &
+  daemon_pid=$!
+  daemon_identity=$(pid_identity "$state" "$daemon_pid") || {
+    kill "$daemon_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    fail "could not identify fake away daemon pid"
+  }
+  printf '%s\n' "$daemon_pid" > "$state/.supervise-daemon.pid"
+  printf '%s\n' "$daemon_identity" > "$state/.supervise-daemon.pid-identity"
+  printf 'away\n' > "$state/.supervise-daemon.mode"
+  sleep 60 &
+  watcher_pid=$!
+  watcher_identity=$(pid_identity "$state" "$watcher_pid") || {
+    kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "could not identify fake away-hosted watcher pid"
+  }
+  record_watcher_lock "$home" "$state" "$watcher_pid" "$watcher_identity"
+  printf '%s\n' "$watcher_pid" > "$state/.supervise-daemon.watcher.pid"
+  touch "$state/.last-watcher-beat"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || {
+    kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "guard failed"
+  }
+  kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  grep -F 'WATCHER HOSTED WITHOUT HARNESS WAKE DELIVERY' "$err" >/dev/null \
+    || fail "guard did not warn on away daemon-hosted watcher without .afk: $(cat "$err")"
+  grep -F 'mode=away without verified away-mode ownership' "$err" >/dev/null \
+    || fail "guard did not explain missing away ownership: $(cat "$err")"
+  pass "fm-guard: away daemon-hosted watcher without .afk warns when work is in flight"
+}
+
+test_guard_away_daemon_stale_watcher_warning() {
+  local dir state err pid
+  dir=$(make_case guard-away-stale)
+  state="$dir/state"
+  err="$dir/guard.err"
+  printf 'project=x\n' > "$state/task.meta"
+  append_wake "$state" heartbeat heartbeat heartbeat || fail "guard away stale heartbeat append failed"
+  sleep 60 &
+  pid=$!
+  record_away_daemon "$state" "$pid"
+  FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=1 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "guard failed"
+  }
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  grep -F 'Away-mode watcher repair starts with the supervise daemon' "$err" >/dev/null \
+    || fail "guard did not use away-mode watcher wording: $(cat "$err")"
+  grep -F 'inspect state/.supervise-daemon.log' "$err" >/dev/null \
+    || fail "guard did not point at the away daemon log: $(cat "$err")"
+  grep -F 'Stop the daemon or exit /afk before falling back to bin/fm-watch-arm.sh' "$err" >/dev/null \
+    || fail "guard did not require stopping away mode before plain watcher fallback: $(cat "$err")"
+  ! grep -F 'drain them with bin/fm-wake-drain.sh' "$err" >/dev/null \
+    || fail "guard told away mode to drain queued wakes: $(cat "$err")"
+  ! grep -F 'After draining queued wakes, re-arm the watcher' "$err" >/dev/null \
+    || fail "guard told away mode to arm a competing watcher: $(cat "$err")"
+  pass "fm-guard: live away daemon with stale watcher uses away-mode repair wording"
 }
 
 test_lock_single_winner_under_concurrency() {
@@ -612,6 +847,172 @@ test_attached_arm_signal_is_recorded_in_cycle_ledger() {
   pass "attached arm signals record a classified lifecycle entry"
 }
 
+test_arm_reports_daemon_hosted_watcher_distinctly() {
+  local dir state fakebin out armout i wpid daemon_pid daemon_identity status
+  dir=$(make_case arm-hosted-daemon)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  armout="$dir/arm.out"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  wpid=$!
+  i=0
+  while [ "$i" -lt 60 ]; do
+    [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] && [ -e "$state/.last-watcher-beat" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(cat "$state/.watch.lock/pid" 2>/dev/null || true)" = "$wpid" ] || fail "seed watcher did not take the lock"
+  sleep 300 &
+  daemon_pid=$!
+  daemon_identity=$(pid_identity "$state" "$daemon_pid") || {
+    kill "$wpid" "$daemon_pid" 2>/dev/null || true
+    wait "$wpid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    fail "could not identify fake daemon pid"
+  }
+  printf '%s\n' "$daemon_pid" > "$state/.supervise-daemon.pid"
+  printf '%s\n' "$daemon_identity" > "$state/.supervise-daemon.pid-identity"
+  printf '%s\n' "$wpid" > "$state/.supervise-daemon.watcher.pid"
+  printf 'neutral\n' > "$state/.supervise-daemon.mode"
+  status=0
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" "$WATCH_ARM" > "$armout" || status=$?
+  [ "$status" -ne 0 ] || fail "arm exited zero for neutral daemon-hosted watcher"
+  grep -F "watcher: hosted-by-daemon pid=$wpid mode=neutral" "$armout" >/dev/null \
+    || fail "arm did not report daemon-hosted neutral watcher: $(cat "$armout")"
+  grep -F 'no harness wake delivery' "$armout" >/dev/null \
+    || fail "arm did not explain missing harness wake delivery: $(cat "$armout")"
+  printf 'away\n' > "$state/.supervise-daemon.mode"
+  status=0
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" "$WATCH_ARM" > "$armout" || status=$?
+  [ "$status" -ne 0 ] || fail "arm exited zero for away daemon-hosted watcher without .afk"
+  grep -F "watcher: hosted-by-daemon pid=$wpid mode=away" "$armout" >/dev/null \
+    || fail "arm did not report daemon-hosted away watcher without .afk: $(cat "$armout")"
+  grep -F 'no harness wake delivery' "$armout" >/dev/null \
+    || fail "arm did not explain missing away presence gate: $(cat "$armout")"
+  date '+%s' > "$state/.afk"
+  status=0
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" "$WATCH_ARM" > "$armout" || status=$?
+  [ "$status" -eq 0 ] || fail "arm exited non-zero for active away daemon-hosted watcher (status $status)"
+  grep -F "watcher: hosted-by-daemon pid=$wpid mode=away" "$armout" >/dev/null \
+    || fail "arm did not report daemon-hosted away watcher: $(cat "$armout")"
+  status=0
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" "$WATCH_ARM" --restart > "$armout" || status=$?
+  [ "$status" -ne 0 ] || fail "restart exited zero for active away daemon-hosted watcher"
+  grep -F "watcher: hosted-by-daemon pid=$wpid mode=away" "$armout" >/dev/null \
+    || fail "restart did not report daemon-hosted away watcher: $(cat "$armout")"
+  kill -0 "$wpid" 2>/dev/null || fail "restart killed the daemon-hosted watcher"
+  kill "$wpid" "$daemon_pid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  pass "arm reports daemon-hosted watcher distinctly from normal healthy arms"
+}
+
+test_arm_race_preserves_neutral_hosted_exit_status() {
+  local dir home state fakebin armout blocker hosted daemon_pid blocker_identity hosted_identity daemon_identity setter status
+  dir=$(make_case arm-hosted-race)
+  home=$(cd "$dir" && pwd)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  sleep 300 &
+  blocker=$!
+  blocker_identity=$(pid_identity "$state" "$blocker") || {
+    kill "$blocker" 2>/dev/null || true
+    wait "$blocker" 2>/dev/null || true
+    fail "could not identify blocker pid"
+  }
+  record_watcher_lock "$dir" "$state" "$blocker" "$blocker_identity"
+  sleep 300 &
+  daemon_pid=$!
+  sleep 300 &
+  hosted=$!
+  hosted_identity=$(pid_identity "$state" "$hosted") || {
+    kill "$blocker" "$daemon_pid" "$hosted" 2>/dev/null || true
+    wait "$blocker" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$hosted" 2>/dev/null || true
+    fail "could not identify hosted watcher pid"
+  }
+  daemon_identity=$(pid_identity "$state" "$daemon_pid") || {
+    kill "$blocker" "$daemon_pid" "$hosted" 2>/dev/null || true
+    wait "$blocker" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$hosted" 2>/dev/null || true
+    fail "could not identify daemon pid"
+  }
+  (
+    sleep 0.1
+    printf '%s\n' "$daemon_pid" > "$state/.supervise-daemon.pid"
+    printf '%s\n' "$daemon_identity" > "$state/.supervise-daemon.pid-identity"
+    printf 'neutral\n' > "$state/.supervise-daemon.mode"
+    printf '%s\n' "$hosted" > "$state/.supervise-daemon.watcher.pid"
+    record_watcher_lock "$dir" "$state" "$hosted" "$hosted_identity"
+    touch "$state/.last-watcher-beat"
+  ) &
+  setter=$!
+  status=0
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_STATE_OVERRIDE="$state" FM_ARM_CONFIRM_TIMEOUT=10 "$WATCH_ARM" > "$armout" || status=$?
+  wait "$setter" 2>/dev/null || true
+  kill "$blocker" "$daemon_pid" "$hosted" 2>/dev/null || true
+  wait "$blocker" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  wait "$hosted" 2>/dev/null || true
+  [ "$status" -ne 0 ] || fail "arm race branch exited zero for neutral daemon-hosted watcher"
+  grep -F "watcher: hosted-by-daemon pid=$hosted mode=neutral" "$armout" >/dev/null \
+    || fail "arm race branch did not report neutral daemon-hosted watcher: $(cat "$armout")"
+  pass "arm singleton-race branch preserves neutral daemon-hosted non-zero status"
+}
+
+test_arm_failure_reports_live_away_daemon() {
+  local dir state fakebin armout daemon_pid blocker status
+  dir=$(make_case arm-away-failed-line)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  sleep 300 &
+  daemon_pid=$!
+  record_away_daemon "$state" "$daemon_pid"
+  sleep 300 &
+  blocker=$!
+  mkdir -p "$state/.watch.lock"
+  printf '%s\n' "$blocker" > "$state/.watch.lock/pid"
+  status=0
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_ARM_CONFIRM_TIMEOUT=1 "$WATCH_ARM" > "$armout" || status=$?
+  kill "$daemon_pid" "$blocker" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  wait "$blocker" 2>/dev/null || true
+  [ "$status" -ne 0 ] || fail "arm exited zero for unconfirmed watcher under away daemon"
+  grep -F 'watcher: daemon-owned mode=away - do not arm' "$armout" >/dev/null \
+    || fail "arm did not report the live away daemon on failure: $(cat "$armout")"
+  ! grep -F 'watcher: FAILED - no live watcher with a fresh beacon' "$armout" >/dev/null \
+    || fail "arm printed generic FAILED while an away daemon owned catch-up"
+  pass "arm failure line is away-daemon aware"
+}
+
+test_arm_refuses_to_fork_under_live_away_daemon() {
+  local dir state fakebin armout daemon_pid status before after
+  dir=$(make_case arm-away-prefork)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  sleep 300 &
+  daemon_pid=$!
+  record_away_daemon "$state" "$daemon_pid"
+  before=$(pgrep -f "$WATCH" 2>/dev/null | wc -l | tr -d '[:space:]')
+  status=0
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" "$WATCH_ARM" > "$armout" || status=$?
+  after=$(pgrep -f "$WATCH" 2>/dev/null | wc -l | tr -d '[:space:]')
+  kill "$daemon_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  [ "$status" -ne 0 ] || fail "arm exited zero under live away daemon with no watcher lock"
+  grep -F 'watcher: daemon-owned mode=away - do not arm' "$armout" >/dev/null \
+    || fail "arm did not report live away daemon before forking: $(cat "$armout")"
+  [ "$after" = "$before" ] || fail "arm forked a watcher under live away daemon (before=$before after=$after)"
+  [ ! -e "$state/.watch.lock" ] || fail "arm created a watcher lock under live away daemon"
+  pass "arm refuses to fork a competing watcher under a live away daemon"
+}
+
 test_arm_starts_and_self_heals() {
   # Arming with no confirmable watcher must FORK one and confirm it live + fresh
   # before reporting 'started' - whether the lock is empty (clean start) or held
@@ -962,6 +1363,13 @@ test_linux_pid_identity_ignores_wall_clock_and_detects_pid_reuse
 test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
+test_guard_warns_queued_wakes_without_inflight
+test_guard_away_daemon_owns_fresh_queue
+test_guard_away_daemon_tolerates_fresh_respawn_gap
+test_guard_away_daemon_warns_on_foreign_watcher_lock
+test_guard_warns_on_neutral_daemon_hosted_watcher
+test_guard_warns_on_away_daemon_hosted_watcher_without_afk
+test_guard_away_daemon_stale_watcher_warning
 test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency
@@ -976,6 +1384,10 @@ test_watcher_self_evicts_on_lock_takeover
 test_arm_self_eviction_is_loud_without_successor
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_attached_arm_signal_is_recorded_in_cycle_ledger
+test_arm_reports_daemon_hosted_watcher_distinctly
+test_arm_race_preserves_neutral_hosted_exit_status
+test_arm_failure_reports_live_away_daemon
+test_arm_refuses_to_fork_under_live_away_daemon
 test_arm_starts_and_self_heals
 test_arm_hup_cleans_child_and_temp_output
 test_arm_propagates_immediate_wake_before_confirmation

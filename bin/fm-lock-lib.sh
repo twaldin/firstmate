@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Shared "is this git lock file provably abandoned?" decision procedure.
+# Shared lock process predicates.
+#
+# This file owns both firstmate session-lock process recognition and the
+# "is this git lock file provably abandoned?" decision procedure.
 #
 # ONE owner for the staleness proof that fm-teardown.sh (a worktree index.lock)
 # and fm-fleet-sync.sh (a clone's .git/packed-refs.lock) both rely on: a lock is
@@ -101,4 +104,38 @@ fm_lock_is_provably_stale() {
     return 1
   fi
   [ "$age" -ge "$min_age" ]
+}
+
+# Known harness command names; extend when a new adapter is verified.
+FM_SESSION_HARNESS_RE='claude|codex|opencode|grok|^pi$'
+
+fm_session_basename() {
+  basename -- "$1" 2>/dev/null || printf '%s\n' "$1"
+}
+
+fm_session_harness_pid() {
+  local pid=$$ comm args
+  for _ in 1 2 3 4 5 6 7 8; do
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
+    args=$(ps -o args= -p "$pid" 2>/dev/null)
+    if printf '%s' "$(fm_session_basename "$comm")" | grep -qE "$FM_SESSION_HARNESS_RE"; then
+      echo "$pid"; return 0
+    fi
+    # Preserve the historical interpreter fallback: node/python launchers often
+    # hide the harness name in the CLI script path rather than argv[0].
+    case "$comm" in
+      *node*|*python*) printf '%s' "$args" | grep -qE "$FM_SESSION_HARNESS_RE" && { echo "$pid"; return 0; } ;;
+    esac
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ -n "$pid" ] && [ "$pid" -gt 1 ] || return 1
+  done
+  return 1
+}
+
+fm_session_holder_alive() {
+  local pid=$1 comm args
+  kill -0 "$pid" 2>/dev/null || return 1
+  comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
+  args=$(ps -o args= -p "$pid" 2>/dev/null)
+  printf '%s' "$(fm_session_basename "$comm") $args" | grep -qE "$FM_SESSION_HARNESS_RE"
 }

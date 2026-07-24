@@ -2,9 +2,10 @@
 # Safe, home-scoped (re-)arm of the firstmate watcher, with honest verification.
 #
 # The watcher (bin/fm-watch.sh) blocks until it has an actionable wake to
-# surface, then prints one reason line and exits. While state/.afk exists the
-# daemon owns triage and the watcher exits on every wake for the daemon to
-# classify. Reliability depends on arming through a mechanism that SURVIVES the
+# surface, then prints one reason line and exits. When the away-mode daemon
+# launches it with FM_WATCHER_AWAY_MODE=1 while state/.afk exists, the daemon
+# owns triage and the watcher exits on every wake for the daemon to classify.
+# Reliability depends on arming through a mechanism that SURVIVES the
 # call and NOTIFIES on exit, so firstmate must run this script as the harness's
 # own tracked background task (e.g. run_in_background). Run it as its own
 # standalone background task, never bundled onto the tail of another command.
@@ -25,6 +26,8 @@
 #   watcher: started pid=<N> (beacon fresh)              - it launched one and confirmed it
 #   watcher: attached pid=<N> (beacon <age>s)            - a live+fresh successor holds the lock;
 #                                                          this arm attaches and follows it
+#   watcher: hosted-by-daemon pid=<N> mode=<M> ...       - the supervise daemon owns this watcher
+#   watcher: daemon-owned mode=away ...                  - away daemon is live while this arm cannot confirm a watcher
 #   watcher: FAILED - no live watcher with a fresh beacon  - could not confirm one
 #   watcher: FAILED - cycle ended without an actionable reason
 #                                                        - a clean cycle ended with no wake and no
@@ -38,6 +41,8 @@
 # never a clean empty completion. On FAILED it exits non-zero so the failure is
 # loud. A live cycle already present means re-arm attaches - do not start a second
 # watcher.
+# In neutral daemon-host mode, hosted-by-daemon exits non-zero because this call
+# cannot provide harness background-task wake delivery until that daemon is stopped.
 #
 # Every observed watcher cycle appends one tab-separated lifecycle record to
 # state/.watch-cycle-exits.log. The arm layer owns that bounded ledger; it records
@@ -58,6 +63,8 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-supervision-lib.sh
+. "$SCRIPT_DIR/fm-supervision-lib.sh"
 
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 WATCH_LOCK="$STATE/.watch.lock"
@@ -232,6 +239,48 @@ report_attached() {
   echo "watcher: attached pid=$HEALTHY_PID (beacon ${age}s)"
 }
 
+DAEMON_HOST_MODE=
+DAEMON_HOST_PID=
+daemon_hosted_watcher_mode() {
+  DAEMON_HOST_MODE=
+  DAEMON_HOST_PID=
+  fm_daemon_hosted_watcher_mode "$STATE" "$WATCH" "$GRACE" "$FM_HOME" || return 1
+  DAEMON_HOST_MODE=$FM_DAEMON_HOSTED_WATCHER_MODE
+  DAEMON_HOST_PID=$FM_DAEMON_HOSTED_WATCHER_PID
+}
+
+report_daemon_hosted() {
+  daemon_hosted_watcher_mode || return 1
+  case "$DAEMON_HOST_MODE" in
+    away)
+      if fm_away_daemon_owns_catchup "$STATE"; then
+        echo "watcher: hosted-by-daemon pid=$DAEMON_HOST_PID mode=away - /afk daemon owns wake delivery"
+        return 0
+      fi
+      echo "watcher: hosted-by-daemon pid=$DAEMON_HOST_PID mode=away - no harness wake delivery; stop daemon before arming a tracked cycle"
+      return 1
+      ;;
+    *)
+      echo "watcher: hosted-by-daemon pid=$DAEMON_HOST_PID mode=$DAEMON_HOST_MODE - no harness wake delivery; stop daemon before arming a tracked cycle"
+      return 1
+      ;;
+  esac
+}
+
+report_failed() {
+  if report_daemon_hosted; then
+    return 0
+  elif [ -n "$DAEMON_HOST_MODE" ]; then
+    return 1
+  fi
+  if fm_away_daemon_owns_catchup "$STATE"; then
+    echo "watcher: daemon-owned mode=away - do not arm; inspect state/.supervise-daemon.log or exit /afk"
+    return 1
+  fi
+  echo "watcher: FAILED - no live watcher with a fresh beacon"
+  return 1
+}
+
 # Give a successor the same bounded confirmation window used for a fresh child.
 # Adapter-owned continuations normally win immediately, but the bound avoids a
 # false failure when process-close delivery and lock publication cross briefly.
@@ -323,6 +372,10 @@ case "${1:-}" in
 esac
 
 if [ "$mode" = restart ]; then
+  if daemon_hosted_watcher_mode || fm_away_daemon_owns_catchup "$STATE"; then
+    report_failed
+    exit $?
+  fi
   # Home-scoped stop: only the watcher pid recorded in THIS home's lock.
   lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
   if fm_pid_alive "$lock_pid"; then
@@ -347,10 +400,17 @@ fi
 # then, not as an immediate empty wake. (--restart skips this: it just stopped
 # this home's watcher and wants a fresh one.)
 if [ "$mode" = arm ] && healthy_watcher; then
+  if daemon_hosted_watcher_mode; then
+    report_daemon_hosted
+    exit $?
+  fi
   cycle_mark_predecessor_successor "attached:$HEALTHY_PID"
   cycle_begin "$HEALTHY_PID" attached
   report_attached
   attach_and_wait "$HEALTHY_PID"
+fi
+if [ "$mode" = arm ] && fm_away_daemon_owns_catchup "$STATE"; then
+  report_failed
   exit $?
 fi
 
@@ -387,8 +447,8 @@ trap 'handle_arm_signal TERM 143' TERM
 trap 'handle_arm_signal INT 130' INT
 
 child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
-  echo "watcher: FAILED - no live watcher with a fresh beacon"
-  exit 1
+  report_failed
+  exit $?
 }
 "$WATCH" >"$child_out" &
 child=$!
@@ -462,6 +522,13 @@ while :; do
       owned_child_finished "$rc"
       exit $?
     fi
+    if daemon_hosted_watcher_mode; then
+      report_daemon_hosted
+      report_status=$?
+      wait "$child" 2>/dev/null || true
+      rm -f "$child_out" 2>/dev/null || true
+      exit "$report_status"
+    fi
     # Another watcher won the singleton; our child stood down.
     wait "$child"
     rc=$?
@@ -485,5 +552,6 @@ cleanup_child
 wait "$child" 2>/dev/null
 rc=$?
 cycle_log_append "$rc" "$(cycle_signal_name "$rc")" confirmation-timeout none
-echo "watcher: FAILED - no live watcher with a fresh beacon"
-exit 1
+report_failed
+report_status=$?
+exit "$report_status"
