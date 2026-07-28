@@ -10,8 +10,9 @@
 # missing or older than FM_GUARD_GRACE seconds, prints a loud, clearly delimited
 # banner so the agent cannot skim past it in the tool output of whatever it was
 # doing - the one channel every harness has. The full banner is emitted once per
-# distinct staleness episode in this FM_HOME (keyed to beacon mtime or absence);
-# later guarded commands in the same episode print a one-line reminder instead.
+# distinct staleness episode in this FM_HOME (keyed to beacon mtime or absence,
+# or to the hosted watcher identity for a daemon wake-delivery gap); later
+# guarded commands in the same episode print a one-line reminder instead.
 # Episode state lives only under state/.guard-watcher-stale-banner (volatile,
 # bounded). Independent alarms (queued wakes, worktree tangle) are never
 # suppressed by that dedup. Normal wake handling (watcher briefly down between a
@@ -54,6 +55,15 @@ fm_guard_stale_episode_key() {
   else
     printf 'beat:absent\n'
   fi
+}
+
+# Delivery-gap episodes ride a live watcher whose beacon keeps ticking, so a
+# beacon-derived key would change every poll cycle and defeat dedup. Key them to
+# the hosted watcher identity instead: one full banner per hosted-watcher
+# episode, a reminder for the rest of it.
+fm_guard_delivery_gap_episode_key() {
+  local mode=$1 pid=$2
+  printf 'gap:%s:%s\n' "${mode:-unknown}" "${pid:-unknown}"
 }
 
 # Claim the full banner for this episode. Exit 0 = print full banner (this call
@@ -155,6 +165,7 @@ away_daemon_active=false
 away_supervision_healthy=false
 daemon_delivery_gap=false
 daemon_delivery_gap_mode=
+daemon_delivery_gap_pid=
 fm_away_daemon_owns_catchup "$STATE" && away_daemon_active=true
 if [ "$away_daemon_active" = true ] && fm_away_supervision_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" "$watcher_fresh"; then
   away_supervision_healthy=true
@@ -162,6 +173,7 @@ fi
 if fm_daemon_hosted_watcher_without_delivery "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
   daemon_delivery_gap=true
   daemon_delivery_gap_mode=$FM_DAEMON_HOSTED_WATCHER_MODE
+  daemon_delivery_gap_pid=$FM_DAEMON_HOSTED_WATCHER_PID
 fi
 
 warn_queued_wakes() {
@@ -175,6 +187,10 @@ warn_queued_wakes() {
 }
 
 if [ "$in_flight" -eq 0 ]; then
+  # Leave the unhealthy state (no work riding on the watcher): clear so a later
+  # in-flight + stale combination is a fresh episode even if the beacon is still
+  # absent with the same key string.
+  [ "$READ_ONLY" -eq 1 ] || fm_guard_clear_stale_banner
   if "$queue_pending" && { [ "$away_daemon_active" != true ] || [ "$away_supervision_healthy" != true ]; }; then
     warn_queued_wakes
   fi
@@ -184,16 +200,17 @@ fi
 # No fresh watcher with tasks in flight is the dangerous state: emit a prominent,
 # bordered banner FIRST so it reads as an alarm, not a buried stderr line.
 if [ "$watcher_fresh" = false ] || [ "$daemon_delivery_gap" = true ]; then
-  episode_key=$(fm_guard_stale_episode_key "$STATE")
+  if [ "$daemon_delivery_gap" = true ]; then
+    episode_key=$(fm_guard_delivery_gap_episode_key "$daemon_delivery_gap_mode" "$daemon_delivery_gap_pid")
+  else
+    episode_key=$(fm_guard_stale_episode_key "$STATE")
+  fi
   episode_key=${episode_key%$'\n'}
-  print_full_banner=1
-  if [ "$daemon_delivery_gap" != true ]; then
-    print_full_banner=0
-    if [ "$READ_ONLY" -eq 1 ]; then
-      fm_guard_stale_banner_seen "$STATE" "$episode_key" || print_full_banner=1
-    elif fm_guard_claim_stale_banner "$STATE" "$episode_key"; then
-      print_full_banner=1
-    fi
+  print_full_banner=0
+  if [ "$READ_ONLY" -eq 1 ]; then
+    fm_guard_stale_banner_seen "$STATE" "$episode_key" || print_full_banner=1
+  elif fm_guard_claim_stale_banner "$STATE" "$episode_key"; then
+    print_full_banner=1
   fi
   if [ "$print_full_banner" -eq 1 ]; then
     if [ "$READ_ONLY" -eq 1 ]; then
@@ -239,6 +256,9 @@ if [ "$watcher_fresh" = false ] || [ "$daemon_delivery_gap" = true ]; then
       printf '●  %s\n' "$fix"
       printf '●%s\n' "$rule"
     } >&2
+  elif [ "$daemon_delivery_gap" = true ]; then
+    printf 'WARNING: watcher still daemon-hosted in mode=%s without verified away-mode wake delivery - full banner already printed this episode.\n' \
+      "$daemon_delivery_gap_mode" >&2
   else
     printf 'WARNING: watcher still down (same stale episode; last beat: %s, grace %ss) - full banner already printed this episode.\n' \
       "$beacon_desc" "$GRACE" >&2

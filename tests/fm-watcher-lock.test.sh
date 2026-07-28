@@ -376,6 +376,59 @@ test_guard_warns_on_away_daemon_hosted_watcher_without_afk() {
   pass "fm-guard: away daemon-hosted watcher without .afk warns when work is in flight"
 }
 
+test_guard_dedups_daemon_hosted_delivery_gap_banner() {
+  local dir home state err1 err2 marker daemon_pid watcher_pid watcher_identity daemon_identity
+  dir=$(make_case guard-hosted-gap-dedup)
+  home=$(cd "$dir" && pwd)
+  state="$dir/state"
+  err1="$dir/guard1.err"
+  err2="$dir/guard2.err"
+  marker="$state/.guard-watcher-stale-banner"
+  printf 'project=x\n' > "$state/task.meta"
+  sleep 60 &
+  daemon_pid=$!
+  daemon_identity=$(pid_identity "$state" "$daemon_pid") || {
+    kill "$daemon_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    fail "could not identify fake away daemon pid"
+  }
+  printf '%s\n' "$daemon_pid" > "$state/.supervise-daemon.pid"
+  printf '%s\n' "$daemon_identity" > "$state/.supervise-daemon.pid-identity"
+  printf 'away\n' > "$state/.supervise-daemon.mode"
+  sleep 60 &
+  watcher_pid=$!
+  watcher_identity=$(pid_identity "$state" "$watcher_pid") || {
+    kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "could not identify fake away-hosted watcher pid"
+  }
+  record_watcher_lock "$home" "$state" "$watcher_pid" "$watcher_identity"
+  printf '%s\n' "$watcher_pid" > "$state/.supervise-daemon.watcher.pid"
+  touch "$state/.last-watcher-beat"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err1" >/dev/null
+  # The hosted watcher keeps beating through the gap; the episode key must track
+  # the hosted watcher identity, not the beacon, or dedup never holds.
+  touch "$state/.last-watcher-beat"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err2" >/dev/null
+  kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  grep -F 'WATCHER HOSTED WITHOUT HARNESS WAKE DELIVERY' "$err1" >/dev/null \
+    || fail "first delivery-gap guard call did not print the full banner: $(cat "$err1")"
+  case "$(cat "$marker" 2>/dev/null || true)" in
+    gap:away:"$watcher_pid") : ;;
+    *) fail "delivery-gap episode key must be the hosted watcher identity, got: $(cat "$marker" 2>/dev/null || true)" ;;
+  esac
+  ! grep -F 'WATCHER HOSTED WITHOUT HARNESS WAKE DELIVERY' "$err2" >/dev/null \
+    || fail "second delivery-gap guard call repeated the full banner: $(cat "$err2")"
+  grep -F 'full banner already printed this episode' "$err2" >/dev/null \
+    || fail "second delivery-gap guard call did not print the concise reminder: $(cat "$err2")"
+  grep -F 'without verified away-mode wake delivery' "$err2" >/dev/null \
+    || fail "delivery-gap reminder did not describe the delivery gap: $(cat "$err2")"
+  pass "fm-guard: daemon-hosted delivery-gap banner dedups per hosted-watcher episode"
+}
+
 test_guard_away_daemon_stale_watcher_warning() {
   local dir state err pid
   dir=$(make_case guard-away-stale)
@@ -1355,6 +1408,7 @@ test_guard_away_daemon_tolerates_fresh_respawn_gap
 test_guard_away_daemon_warns_on_foreign_watcher_lock
 test_guard_warns_on_neutral_daemon_hosted_watcher
 test_guard_warns_on_away_daemon_hosted_watcher_without_afk
+test_guard_dedups_daemon_hosted_delivery_gap_banner
 test_guard_away_daemon_stale_watcher_warning
 test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock

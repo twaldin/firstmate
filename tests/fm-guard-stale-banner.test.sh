@@ -106,6 +106,29 @@ test_healthy_recovery_rearms_next_stale_episode() {
   pass "fm-guard stale banner: healthy recovery rearms the next stale episode"
 }
 
+test_drained_work_rearms_next_stale_episode() {
+  local dir home out1 drained out2
+  dir=$(make_guard_case drained-work)
+  home=$(case_home "$dir")
+  out1=$(run_guard_case "$dir")
+  [ "$(count_text "$out1" "WATCHER DOWN - SUPERVISION IS OFF")" -eq 1 ] \
+    || fail "first stale episode did not print the full banner: $out1"
+
+  rm -f "$home/state/task.meta"
+  drained=$(run_guard_case "$dir")
+  [ -z "$drained" ] || fail "guard should be silent once work drains, got: $drained"
+  assert_absent "$home/state/.guard-watcher-stale-banner" \
+    "draining in-flight work must clear the stale-banner marker"
+
+  # Beacon stayed absent throughout, so the episode key is unchanged: only the
+  # drain-time clear can re-arm the alarm for the new dangerous episode.
+  fm_write_meta "$home/state/task.meta" "window=firstmate:fm-task" "kind=ship"
+  out2=$(run_guard_case "$dir")
+  [ "$(count_text "$out2" "WATCHER DOWN - SUPERVISION IS OFF")" -eq 1 ] \
+    || fail "new work under a still-absent beacon did not re-print the full banner: $out2"
+  pass "fm-guard stale banner: draining in-flight work rearms the next stale episode"
+}
+
 test_concurrent_same_episode_prints_one_full_banner() {
   local dir out_dir i pids pid all full reminders
   dir=$(make_guard_case concurrent-stale)
@@ -243,6 +266,7 @@ test_read_only_never_mutates_stale_banner_state_files() {
 test_first_stale_call_prints_full_banner
 test_repeated_same_episode_prints_reminder_only
 test_healthy_recovery_rearms_next_stale_episode
+test_drained_work_rearms_next_stale_episode
 test_concurrent_same_episode_prints_one_full_banner
 test_home_isolation
 test_queued_wake_warning_stays_independent
