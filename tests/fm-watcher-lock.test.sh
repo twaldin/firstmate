@@ -948,7 +948,7 @@ test_arm_reports_daemon_hosted_watcher_distinctly() {
   date '+%s' > "$state/.afk"
   status=0
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" "$WATCH_ARM" > "$armout" || status=$?
-  [ "$status" -eq 0 ] || fail "arm exited non-zero for active away daemon-hosted watcher (status $status)"
+  [ "$status" -ne 0 ] || fail "arm exited zero for active away daemon-hosted watcher without providing a tracked cycle"
   grep -F "watcher: hosted-by-daemon pid=$wpid mode=away" "$armout" >/dev/null \
     || fail "arm did not report daemon-hosted away watcher: $(cat "$armout")"
   status=0

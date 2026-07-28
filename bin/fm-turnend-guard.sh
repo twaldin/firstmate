@@ -137,7 +137,10 @@ fi
 if [ "$FM_SUP_QUEUE_PENDING" = true ] && [ "$AWAY_SUPERVISION_HEALTHY" != true ] && session_lock_allows_queue_block; then
   QUEUE_BLOCK=true
 fi
-if [ "$FM_SUP_IN_FLIGHT" -gt 0 ] && [ "$DAEMON_DELIVERY_GAP" = true ]; then
+if [ "$DAEMON_DELIVERY_GAP" = true ] && {
+     [ "$FM_SUP_QUEUE_PENDING" = true ] \
+       || { [ "$DAEMON_DELIVERY_GAP_MODE" = away ] && [ "$FM_SUP_IN_FLIGHT" -gt 0 ]; }
+   }; then
   WATCH_BLOCK=daemon
 elif [ "$FM_SUP_IN_FLIGHT" -gt 0 ] && [ "$AWAY_DAEMON_ACTIVE" != true ] && ! fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
   WATCH_BLOCK=true

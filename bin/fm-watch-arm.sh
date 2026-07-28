@@ -41,8 +41,9 @@
 # never a clean empty completion. On FAILED it exits non-zero so the failure is
 # loud. A live cycle already present means re-arm attaches - do not start a second
 # watcher.
-# In neutral daemon-host mode, hosted-by-daemon exits non-zero because this call
-# cannot provide harness background-task wake delivery until that daemon is stopped.
+# In daemon-host mode, hosted-by-daemon exits non-zero because this call cannot
+# provide a harness background-task wake cycle until that daemon is stopped or
+# away mode is exited.
 #
 # Every observed watcher cycle appends one tab-separated lifecycle record to
 # state/.watch-cycle-exits.log. The arm layer owns that bounded ledger; it records
@@ -260,7 +261,7 @@ report_daemon_hosted() {
     away)
       if fm_away_daemon_owns_catchup "$STATE"; then
         echo "watcher: hosted-by-daemon pid=$pid mode=away - /afk daemon owns wake delivery"
-        return 0
+        return 1
       fi
       echo "watcher: hosted-by-daemon pid=$pid mode=away - no harness wake delivery; stop daemon before arming a tracked cycle"
       return 1
@@ -274,7 +275,7 @@ report_daemon_hosted() {
 
 report_failed() {
   if report_daemon_hosted; then
-    return 0
+    return 1
   elif [ -n "$DAEMON_HOST_MODE" ]; then
     return 1
   fi
@@ -458,7 +459,7 @@ trap 'handle_arm_signal INT 130' INT
 
 child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
   report_failed
-  exit $?
+  exit 1
 }
 "$WATCH" >"$child_out" &
 child=$!

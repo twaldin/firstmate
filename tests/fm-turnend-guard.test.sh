@@ -522,9 +522,9 @@ test_hook_blocks_watcher_gap_with_live_away_daemon() {
   pass "fm-turnend-guard: blocks away watcher gaps and queued wakes together"
 }
 
-test_hook_blocks_neutral_daemon_hosted_watcher_with_inflight() {
+test_hook_allows_neutral_daemon_hosted_watcher_until_queue_pending() {
   local dir daemon_pid watcher_pid watcher_identity out status
-  dir=$(make_primary_dir "$TMP_ROOT/hook-neutral-hosted-watch")
+  dir=$(make_primary_dir "$TMP_ROOT/hook-neutral-hosted-watch-empty")
   record_session_lock "$dir"
   : > "$dir/state/task1.meta"
   sleep 60 &
@@ -545,10 +545,39 @@ test_hook_blocks_neutral_daemon_hosted_watcher_with_inflight() {
   kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
   wait "$daemon_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
-  expect_code 2 "$status" "hook must block when a neutral daemon-hosted watcher cannot wake firstmate"
+  expect_code 0 "$status" "hook must allow a neutral daemon-hosted watcher when no queued wake needs delivery"
+  [ -z "$out" ] || fail "neutral daemon-hosted watcher without queued wakes printed a block: $out"
+  pass "fm-turnend-guard: allows neutral daemon-hosted watcher while the wake queue is empty"
+}
+
+test_hook_blocks_neutral_daemon_hosted_watcher_with_queue() {
+  local dir daemon_pid watcher_pid watcher_identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-neutral-hosted-watch-queue")
+  record_session_lock "$dir"
+  : > "$dir/state/task1.meta"
+  printf 'record\n' > "$dir/state/.wake-queue"
+  sleep 60 &
+  daemon_pid=$!
+  record_neutral_daemon "$dir" "$daemon_pid"
+  sleep 60 &
+  watcher_pid=$!
+  watcher_identity=$(watcher_identity "$dir" "$watcher_pid") || {
+    kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "could not identify neutral-hosted watcher with queue"
+  }
+  record_watcher_lock "$dir" "$watcher_pid" "$watcher_identity"
+  printf '%s\n' "$watcher_pid" > "$dir/state/.supervise-daemon.watcher.pid"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  expect_code 2 "$status" "hook must block when a neutral daemon-hosted watcher has queued wakes to deliver"
   assert_contains "$out" 'watcher is daemon-hosted in mode=neutral without verified away-mode ownership' "neutral daemon-hosted watcher block must explain missing wake delivery"
   assert_contains "$out" 'Stop the watcher host, or re-enter /afk' "neutral daemon-hosted watcher block must give repair"
-  pass "fm-turnend-guard: blocks neutral daemon-hosted watcher delivery gaps"
+  pass "fm-turnend-guard: blocks neutral daemon-hosted watcher only when queued wakes need delivery"
 }
 
 test_hook_combines_queue_and_watcher_blocks() {
@@ -1248,7 +1277,8 @@ test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
 test_hook_blocks_when_queue_pending_with_live_lock
 test_hook_blocks_watcher_gap_with_live_away_daemon
-test_hook_blocks_neutral_daemon_hosted_watcher_with_inflight
+test_hook_allows_neutral_daemon_hosted_watcher_until_queue_pending
+test_hook_blocks_neutral_daemon_hosted_watcher_with_queue
 test_hook_combines_queue_and_watcher_blocks
 test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_blocks_when_unhealthy_in_primary

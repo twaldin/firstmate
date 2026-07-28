@@ -107,6 +107,8 @@ test_starts_away_daemon_and_verifies_readiness() {
     || fail "launcher did not leave mode=away while daemon was ready"
   [ -s "$state/.supervise-daemon.pid-identity" ] \
     || fail "launcher did not wait for pid identity readiness"
+  [ -s "$state/.supervise-daemon.lock/pid-identity" ] \
+    || fail "daemon did not write pid identity into its singleton lock owner"
   [ -e "$state/.afk" ] \
     || fail "launcher did not write .afk after daemon readiness"
   grep -F 'mode=away' "$state/.supervise-daemon.log" >/dev/null \

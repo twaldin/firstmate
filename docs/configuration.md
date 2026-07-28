@@ -102,7 +102,7 @@ Use it instead of the plain `bin/fm-watch-arm.sh` re-arm loop only when a home d
 Neutral host mode does not provide harness background-task completion or injection.
 Both paths share the same watcher lock and liveness beacon, so `fm-watch-arm.sh` remains an honest verifier.
 The `/afk` sub-supervisor starts the same daemon with the explicit away-mode opt-in and injects escalation digests into firstmate's own pane independently of where new task endpoints are spawned.
-`bin/fm-afk-start.sh` owns `/afk` startup and writes `state/.afk` only after the away daemon is verified ready.
+`bin/fm-afk-start.sh` owns direct `/afk` startup: it writes `state/.afk` before foregrounding the daemon, and the daemon removes that fresh flag again if startup validation fails before ready mode and pid identity are published.
 It currently supports only `tmux` and `herdr` supervisor panes.
 Set `FM_SUPERVISOR_BACKEND=tmux|herdr` and `FM_SUPERVISOR_TARGET=<target>` to override both axes explicitly; for herdr the target is `"<session>:<pane-id>"`.
 Without overrides, backend detection uses `$TMUX_PANE` first, then `HERDR_ENV=1` with `HERDR_PANE_ID`, then falls back to `tmux`.

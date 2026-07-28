@@ -645,9 +645,32 @@ escalate_add() {  # <state> <distilled-item>
   lines=$(wc -l < "$buf" 2>/dev/null || echo 0)
   if [ "$lines" -gt "$max_lines" ]; then
     tmp=$(mktemp "${TMPDIR:-/tmp}/fm-escalations.XXXXXX") || return 0
-    tail -n "$max_lines" "$buf" >"$tmp" 2>/dev/null && mv -f "$tmp" "$buf"
+    awk -v max="$max_lines" '
+      NR == 1 && $0 ~ /^\+[0-9][0-9]* older escalation event\(s\) dropped before this digest$/ {
+        marker = $0
+        sub(/^\+/, "", marker)
+        sub(/ .*/, "", marker)
+        dropped = marker + 0
+        next
+      }
+      { body[++n] = $0 }
+      END {
+        keep = max - 1
+        if (keep < 0) keep = 0
+        if (n > keep) {
+          dropped += n - keep
+        }
+        if (dropped > 0) {
+          print "+" dropped " older escalation event(s) dropped before this digest"
+        }
+        start = n - keep + 1
+        if (start < 1) start = 1
+        for (i = start; i <= n; i++) {
+          print body[i]
+        }
+      }
+    ' "$buf" >"$tmp" 2>/dev/null && mv -f "$tmp" "$buf"
     rm -f "$tmp" 2>/dev/null || true
-    _now > "${buf}.since"
   fi
 }
 
@@ -1477,7 +1500,24 @@ fm_super_main() {
     exit 1
   fi
   echo "$$" > "$PIDFILE"
+  if ! fm_pid_identity "$$" > "$LOCK/pid-identity"; then
+    echo "error: could not record supervise daemon pid identity" >&2
+    fm_lock_release "$LOCK" 2>/dev/null || true
+    rm -f "$PIDFILE" "$MODEFILE" "$IDENTITYFILE" 2>/dev/null || true
+    exit 1
+  fi
   rm -f "$WATCHER_PIDFILE" 2>/dev/null || true
+  startup_fail() {
+    local rc=${1:-1}
+    fm_lock_release "$LOCK" 2>/dev/null || true
+    rm -f "$PIDFILE" 2>/dev/null || true
+    rm -f "$MODEFILE" 2>/dev/null || true
+    rm -f "$IDENTITYFILE" 2>/dev/null || true
+    if [ "$AWAY_MODE" -eq 1 ] && [ "${FM_AFK_START_OWNS_FLAG:-0}" = 1 ]; then
+      rm -f "$STATE/.afk" 2>/dev/null || true
+    fi
+    exit "$rc"
+  }
 
   if [ "$AWAY_MODE" -eq 1 ]; then
     # --- auto-discover the supervisor BACKEND (tmux vs herdr) first ---------
@@ -1504,11 +1544,7 @@ fm_super_main() {
     if ! fm_backend_list_contains "$FM_SUPERVISOR_SUPPORTED_BACKENDS" "$BACKEND"; then
       echo "error: away-mode daemon does not support supervisor backend '$BACKEND' yet (supported: $FM_SUPERVISOR_SUPPORTED_BACKENDS); set FM_SUPERVISOR_BACKEND=tmux|herdr and FM_SUPERVISOR_TARGET to run firstmate's own pane under a supported backend" >&2
       log "startup failed: unsupported supervisor backend '$BACKEND' (source=$backend_source)"
-      fm_lock_release "$LOCK" 2>/dev/null || true
-      rm -f "$PIDFILE" 2>/dev/null || true
-      rm -f "$MODEFILE" 2>/dev/null || true
-      rm -f "$IDENTITYFILE" 2>/dev/null || true
-      exit 1
+      startup_fail 1
     fi
 
     # --- auto-discover the supervisor target (the pane running firstmate) ---
@@ -1535,19 +1571,11 @@ fm_super_main() {
     if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
       echo "error: supervisor target '$TARGET' does not resolve to a $BACKEND pane; set FM_SUPERVISOR_TARGET" >&2
       log "startup failed: target '$TARGET' not found (backend=$BACKEND)"
-      fm_lock_release "$LOCK" 2>/dev/null || true
-      rm -f "$PIDFILE" 2>/dev/null || true
-      rm -f "$MODEFILE" 2>/dev/null || true
-      rm -f "$IDENTITYFILE" 2>/dev/null || true
-      exit 1
+      startup_fail 1
     fi
 
     if ! fm_super_stop_existing_watcher_for_away "$STATE" "$WATCH" "$FM_HOME"; then
-      fm_lock_release "$LOCK" 2>/dev/null || true
-      rm -f "$PIDFILE" 2>/dev/null || true
-      rm -f "$MODEFILE" 2>/dev/null || true
-      rm -f "$IDENTITYFILE" 2>/dev/null || true
-      exit 1
+      startup_fail 1
     fi
   fi
 

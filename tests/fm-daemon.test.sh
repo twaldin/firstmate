@@ -92,6 +92,7 @@ test_afk_start_ignores_stale_pidfile_without_lock() {
   assert_contains "$out" "starting supervise daemon" "fm-afk-start.sh did not attempt daemon startup"
   assert_contains "$out" "does not support supervisor backend 'unsupported'" "daemon startup did not reach backend validation"
   assert_not_contains "$out" "daemon already running" "fm-afk-start.sh trusted a stale pidfile-only live pid"
+  assert_absent "$state/.afk" "fm-afk-start.sh left a fresh .afk flag after daemon startup validation failed"
   pass "fm-afk-start.sh ignores stale pidfile-only live pids"
 }
 
@@ -113,6 +114,7 @@ test_afk_start_reclaims_stale_daemon_lock_reused_pid() {
   assert_contains "$out" "does not support supervisor backend 'unsupported'" "daemon startup did not reach backend validation after stale lock cleanup"
   assert_not_contains "$out" "daemon already running" "fm-afk-start.sh trusted a stale daemon lock with a reused pid"
   assert_not_contains "$out" "another fm-supervise-daemon is already running" "daemon singleton lock still trusted the reused pid"
+  assert_absent "$state/.afk" "fm-afk-start.sh left .afk after stale-lock startup validation failed"
   pass "fm-afk-start.sh reclaims stale daemon locks whose live pid identity no longer matches"
 }
 
@@ -1147,6 +1149,36 @@ test_max_defer_pending_composer_alarms_without_typing() {
   [ -s "$state/.subsuper-escalations" ] || fail "buffer lost while composer was pending"
   grep -F 'human draft' "$dir/composer" >/dev/null || fail "pending composer content changed"
   pass "max-defer on a pending composer alarms without typing"
+}
+
+test_max_defer_survives_escalation_buffer_trim() {
+  local dir state fakebin sent old_since
+  dir=$(make_bordered_case maxdefer-trimmed-buffer)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  sent="$dir/sent.log"; : > "$sent"
+  printf '│ > human draft │\n' > "$dir/composer"
+  FM_ESCALATE_BUFFER_MAX_LINES=3 escalate_add "$state" "needs-decision: item 1"
+  old_since=$(( $(date +%s) - 600 ))
+  printf '%s\n' "$old_since" > "$state/.subsuper-escalations.since"
+  FM_ESCALATE_BUFFER_MAX_LINES=3 escalate_add "$state" "needs-decision: item 2"
+  FM_ESCALATE_BUFFER_MAX_LINES=3 escalate_add "$state" "needs-decision: item 3"
+  FM_ESCALATE_BUFFER_MAX_LINES=3 escalate_add "$state" "needs-decision: item 4"
+  FM_ESCALATE_BUFFER_MAX_LINES=3 escalate_add "$state" "needs-decision: item 5"
+  [ "$(cat "$state/.subsuper-escalations.since" 2>/dev/null || true)" = "$old_since" ] \
+    || fail "escalation trim reset the max-defer clock"
+  grep -F '+3 older escalation event(s) dropped before this digest' "$state/.subsuper-escalations" >/dev/null \
+    || fail "escalation trim did not preserve a dropped-event marker: $(cat "$state/.subsuper-escalations" 2>/dev/null)"
+  grep -F 'needs-decision: item 5' "$state/.subsuper-escalations" >/dev/null \
+    || fail "escalation trim did not keep the newest event"
+  afk_enter "$state"
+  PATH="$fakebin:$PATH" FM_FAKE_COMPOSER="$dir/composer" FM_FAKE_SENT="$sent" \
+    FM_ESCALATE_BATCH_SECS=99999 FM_MAX_DEFER_SECS=60 FM_INJECT_CONFIRM_SLEEP=0.05 \
+    housekeeping "$state"
+  [ ! -s "$sent" ] || fail "trimmed max-defer typed into a pending composer"
+  [ -s "$state/.subsuper-inject-wedged" ] \
+    || fail "trimmed max-defer buffer did not raise a wedge alarm marker"
+  [ -s "$state/.subsuper-escalations" ] || fail "trimmed max-defer buffer was lost"
+  pass "max-defer survives escalation-buffer trimming and records dropped events"
 }
 
 test_normal_flush_clears_stale_wedge_marker() {
@@ -2428,6 +2460,7 @@ test_submit_ack_reports_pending_on_persistent_swallow
 test_max_defer_empty_swallow_types_once_and_alarms
 test_max_defer_flushes_empty_idle_pane
 test_max_defer_pending_composer_alarms_without_typing
+test_max_defer_survives_escalation_buffer_trim
 test_normal_flush_clears_stale_wedge_marker
 test_below_max_defer_does_nothing
 test_max_defer_afk_inactive_does_not_flush_or_alarm

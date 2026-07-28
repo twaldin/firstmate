@@ -113,12 +113,16 @@ fm_session_basename() {
   basename -- "$1" 2>/dev/null || printf '%s\n' "$1"
 }
 
+fm_session_harness_name_matches() {
+  printf '%s' "$(fm_session_basename "$1")" | grep -qE "$FM_SESSION_HARNESS_RE"
+}
+
 fm_session_harness_pid() {
   local pid=$$ comm args
   for _ in 1 2 3 4 5 6 7 8; do
     comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
     args=$(ps -o args= -p "$pid" 2>/dev/null)
-    if printf '%s' "$(fm_session_basename "$comm")" | grep -qE "$FM_SESSION_HARNESS_RE"; then
+    if fm_session_harness_name_matches "$comm"; then
       echo "$pid"; return 0
     fi
     # Preserve the historical interpreter fallback: node/python launchers often
@@ -137,5 +141,5 @@ fm_session_holder_alive() {
   kill -0 "$pid" 2>/dev/null || return 1
   comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
   args=$(ps -o args= -p "$pid" 2>/dev/null)
-  printf '%s' "$(fm_session_basename "$comm") $args" | grep -qE "$FM_SESSION_HARNESS_RE"
+  fm_session_harness_name_matches "$comm" || printf '%s' "$args" | grep -qE "$FM_SESSION_HARNESS_RE"
 }

@@ -12,6 +12,8 @@
 #     - otherwise clears any prior away session's stale escalation artifacts
 #       (fm_afk_clear_stale_artifacts) for a direct, non-prepared start, then
 #       execs bin/fm-supervise-daemon.sh --away-mode in the foreground.
+#       The execed daemon removes this fresh .afk flag again if startup
+#       validation fails before it can publish ready mode/pid-identity state.
 #       A prepared start was already cleared transactionally by bin/fm-afk-launch.sh.
 #
 # This file is sourceable: its BASH_SOURCE guard keeps main from running, while
@@ -84,18 +86,11 @@ daemon_lock_owner() {
 }
 
 daemon_pid_matches() {
-  local pid=$1 owner=$2 identity current command
+  local pid=$1 owner=$2 identity current
   identity=$(cat "$owner/pid-identity" 2>/dev/null || true)
-  if [ -n "$identity" ]; then
-    current=$(fm_pid_identity "$pid") || return 1
-    [ "$current" = "$identity" ]
-    return
-  fi
-  command=$(ps -p "$pid" -o command= 2>/dev/null || true)
-  case "$command" in
-    *"$FM_AFK_DAEMON"*|*"fm-supervise-daemon.sh"*) return 0 ;;
-  esac
-  return 1
+  [ -n "$identity" ] || return 1
+  current=$(fm_pid_identity "$pid") || return 1
+  [ "$current" = "$identity" ]
 }
 
 daemon_lock_pid() {
@@ -169,7 +164,10 @@ fm_afk_start_main() {
   fi
 
   echo "afk: starting supervise daemon in foreground; keep this command as a tracked background session"
-  exec env FM_SUPERVISE_AWAY_MODE=1 "$FM_AFK_DAEMON" --away-mode
+  if [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ]; then
+    exec env FM_SUPERVISE_AWAY_MODE=1 "$FM_AFK_DAEMON" --away-mode
+  fi
+  exec env FM_SUPERVISE_AWAY_MODE=1 FM_AFK_START_OWNS_FLAG=1 "$FM_AFK_DAEMON" --away-mode
 }
 
 # Run only when executed, not when sourced (tests source fm_afk_clear_stale_artifacts

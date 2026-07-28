@@ -76,6 +76,12 @@ test_holder_alive_matches_exec_argv0_harness() {
   pass "fm_session_holder_alive recognizes exec-argv0 harness holders"
 }
 
+test_holder_alive_matches_pi_basename() {
+  run_holder_alive_case /usr/local/bin/pi 'pi --model default' \
+    || fail "bare pi basename was not recognized as a live holder"
+  pass "fm_session_holder_alive recognizes a bare pi holder"
+}
+
 test_holder_alive_rejects_non_harness_process() {
   if run_holder_alive_case /bin/sleep 'sleep 60'; then
     fail "plain sleep was recognized as a harness holder"
@@ -100,5 +106,6 @@ test_dash_leading_comm_is_quiet() {
 test_harness_pid_matches_bare_harness_comm
 test_harness_pid_preserves_node_args_fallback
 test_holder_alive_matches_exec_argv0_harness
+test_holder_alive_matches_pi_basename
 test_holder_alive_rejects_non_harness_process
 test_dash_leading_comm_is_quiet

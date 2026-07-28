@@ -68,8 +68,8 @@ If `state/.afk` exists, the no-flag default refuses and `--neutral-host` is the 
 While the neutral host is running it can supersede the plain `bin/fm-watch-arm.sh` re-arm loop for watcher liveness in that home; it does not provide the harness background-task completion that normally wakes firstmate to drain queued records.
 Use it only where another turn, guard, or explicit poll path will consume `state/.wake-queue`; `fm-watch-arm.sh` remains the default when immediate firstmate wake delivery is required.
 `fm-watch-arm.sh` remains valid and coherent because it verifies the same `state/.watch.lock` and fresh `state/.last-watcher-beat` rather than assuming it launched the watcher.
-When the lock belongs to a daemon child, it reports `watcher: hosted-by-daemon ...` instead of `watcher: healthy ...`; neutral-host ownership exits non-zero because the arm did not create harness wake delivery.
-When a live away daemon owns catch-up but a plain arm cannot confirm a watcher, it reports `watcher: daemon-owned mode=away ...` instead of the generic failed status.
+When the lock belongs to a daemon child, it reports `watcher: hosted-by-daemon ...` instead of `watcher: healthy ...`; daemon-host ownership exits non-zero because the arm did not create a harness-tracked wake cycle.
+When a live away daemon owns catch-up but a plain arm cannot confirm a watcher, it reports `watcher: daemon-owned mode=away ...` instead of the generic failed status and also exits non-zero.
 Do not run both as competing supervision strategies on purpose.
 If a neutral-hosted watcher fires, consume the durable records with the same `bin/fm-wake-drain.sh` path; the host has no injection pane, sends no notification, and does no wake classification of its own.
 A pull-based guard (`bin/fm-guard.sh`) warns through supervision tool output if the primary checkout is tangled, or if tasks are in flight and that watcher stops running or queued wakes are waiting to be drained.

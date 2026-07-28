@@ -156,7 +156,8 @@ It also exposes `fm_supervision_status` for callers that need the individual fie
 `bin/fm-turnend-guard.sh` deliberately uses a sharper end-of-turn predicate.
 It first refuses any non-empty `state/.wake-queue` only when no live away daemon owns catch-up and no live foreign session lock owns the queue, because a daemon-hosted watcher can keep the liveness beacon healthy while queued wakes still need a lock-owning firstmate turn to drain them unless verified away ownership is active.
 A live away daemon means `state/.afk` exists, `state/.supervise-daemon.mode` is `away`, `state/.supervise-daemon.pid` is alive, and `state/.supervise-daemon.pid-identity` still matches that live process.
-For in-flight work, a daemon-hosted watcher is treated as a delivery gap unless that live away daemon predicate is true, so both neutral hosts and `mode=away` daemons without the `.afk` presence gate block the turn.
+For queued wakes, any daemon-hosted watcher without live away ownership is treated as a delivery gap.
+A neutral host with an empty queue is allowed, while a `mode=away` daemon without the `.afk` presence gate also blocks in-flight work because away-mode ownership itself is incoherent.
 The queue block is skipped for a live away daemon only while watcher supervision is still within beacon grace with no live lock holder, or has a live identity-matched watcher lock whose pid matches `state/.supervise-daemon.watcher.pid`.
 That sidecar is written by `bin/fm-supervise-daemon.sh` every time it starts an away watcher child, so a competing plain watcher cannot make away mode look healthy.
 If that beacon goes stale, the hook tells firstmate to inspect or restart away mode first, then permits `bin/fm-watch-arm.sh` only after the daemon is stopped or `/afk` is exited.
