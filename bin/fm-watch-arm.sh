@@ -260,7 +260,7 @@ report_daemon_hosted() {
   case "$mode" in
     away)
       if fm_away_daemon_owns_catchup "$STATE"; then
-        echo "watcher: hosted-by-daemon pid=$pid mode=away - /afk daemon owns wake delivery"
+        echo "watcher: hosted-by-daemon pid=$pid mode=away - /afk daemon owns wake delivery; no action needed; do not stop the daemon"
         return 1
       fi
       echo "watcher: hosted-by-daemon pid=$pid mode=away - no harness wake delivery; stop daemon before arming a tracked cycle"
@@ -274,9 +274,8 @@ report_daemon_hosted() {
 }
 
 report_failed() {
-  if report_daemon_hosted; then
-    return 1
-  elif [ -n "$DAEMON_HOST_MODE" ]; then
+  report_daemon_hosted
+  if [ -n "$DAEMON_HOST_MODE" ]; then
     return 1
   fi
   if fm_away_daemon_owns_catchup "$STATE"; then

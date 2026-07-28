@@ -1481,8 +1481,19 @@ fm_super_main() {
   local CRASH_NORMAL_SLEEP=${FM_CRASH_NORMAL_SLEEP:-$CRASH_NORMAL_SLEEP_DEFAULT}
   local BACKEND="" TARGET="" backend_source="" target_source=""
   [ "$MODE" = away ] && AWAY_MODE=1
+  startup_fail() {
+    local rc=${1:-1}
+    fm_lock_release "$LOCK" 2>/dev/null || true
+    rm -f "$PIDFILE" 2>/dev/null || true
+    rm -f "$MODEFILE" 2>/dev/null || true
+    rm -f "$IDENTITYFILE" 2>/dev/null || true
+    if [ "$AWAY_MODE" -eq 1 ] && [ "${FM_AFK_START_OWNS_FLAG:-0}" = 1 ]; then
+      rm -f "$STATE/.afk" 2>/dev/null || true
+    fi
+    exit "$rc"
+  }
 
-  [ -x "$WATCH" ] || { echo "error: watcher not found or not executable: $WATCH" >&2; exit 1; }
+  [ -x "$WATCH" ] || { echo "error: watcher not found or not executable: $WATCH" >&2; startup_fail 1; }
 
   if [ "$AWAY_MODE" -eq 0 ] && [ "$NEUTRAL_EXPLICIT" -eq 0 ] && [ -e "$STATE/.afk" ]; then
     echo "error: state/.afk exists; use --away-mode for away supervision or --neutral-host to force a neutral watcher host" >&2
@@ -1500,24 +1511,18 @@ fm_super_main() {
     exit 1
   fi
   echo "$$" > "$PIDFILE"
-  if ! fm_pid_identity "$$" > "$LOCK/pid-identity"; then
+  local lock_identity_tmp
+  lock_identity_tmp=$(mktemp "$STATE/.supervise-daemon.lock-identity.XXXXXX") || {
     echo "error: could not record supervise daemon pid identity" >&2
-    fm_lock_release "$LOCK" 2>/dev/null || true
-    rm -f "$PIDFILE" "$MODEFILE" "$IDENTITYFILE" 2>/dev/null || true
-    exit 1
+    startup_fail 1
+  }
+  if ! fm_pid_identity "$$" > "$lock_identity_tmp" || [ ! -s "$lock_identity_tmp" ] \
+     || ! mv -f "$lock_identity_tmp" "$LOCK/pid-identity"; then
+    rm -f "$lock_identity_tmp" 2>/dev/null || true
+    echo "error: could not record supervise daemon pid identity" >&2
+    startup_fail 1
   fi
   rm -f "$WATCHER_PIDFILE" 2>/dev/null || true
-  startup_fail() {
-    local rc=${1:-1}
-    fm_lock_release "$LOCK" 2>/dev/null || true
-    rm -f "$PIDFILE" 2>/dev/null || true
-    rm -f "$MODEFILE" 2>/dev/null || true
-    rm -f "$IDENTITYFILE" 2>/dev/null || true
-    if [ "$AWAY_MODE" -eq 1 ] && [ "${FM_AFK_START_OWNS_FLAG:-0}" = 1 ]; then
-      rm -f "$STATE/.afk" 2>/dev/null || true
-    fi
-    exit "$rc"
-  }
 
   if [ "$AWAY_MODE" -eq 1 ]; then
     # --- auto-discover the supervisor BACKEND (tmux vs herdr) first ---------

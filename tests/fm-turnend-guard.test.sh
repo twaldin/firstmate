@@ -522,9 +522,9 @@ test_hook_blocks_watcher_gap_with_live_away_daemon() {
   pass "fm-turnend-guard: blocks away watcher gaps and queued wakes together"
 }
 
-test_hook_allows_neutral_daemon_hosted_watcher_until_queue_pending() {
+test_hook_blocks_neutral_daemon_hosted_watcher_without_drain_ack() {
   local dir daemon_pid watcher_pid watcher_identity out status
-  dir=$(make_primary_dir "$TMP_ROOT/hook-neutral-hosted-watch-empty")
+  dir=$(make_primary_dir "$TMP_ROOT/hook-neutral-hosted-watch-noack")
   record_session_lock "$dir"
   : > "$dir/state/task1.meta"
   sleep 60 &
@@ -545,15 +545,47 @@ test_hook_allows_neutral_daemon_hosted_watcher_until_queue_pending() {
   kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
   wait "$daemon_pid" 2>/dev/null || true
   wait "$watcher_pid" 2>/dev/null || true
-  expect_code 0 "$status" "hook must allow a neutral daemon-hosted watcher when no queued wake needs delivery"
-  [ -z "$out" ] || fail "neutral daemon-hosted watcher without queued wakes printed a block: $out"
-  pass "fm-turnend-guard: allows neutral daemon-hosted watcher while the wake queue is empty"
+  expect_code 2 "$status" "hook must block a neutral daemon-hosted watcher with in-flight work until a drain path is acknowledged"
+  assert_contains "$out" 'watcher is daemon-hosted in mode=neutral without verified away-mode ownership' "neutral daemon-hosted no-ack block must explain missing wake delivery"
+  pass "fm-turnend-guard: blocks neutral daemon-hosted watcher without a configured drain acknowledgement"
+}
+
+test_hook_allows_neutral_daemon_hosted_watcher_with_drain_ack_until_queue_pending() {
+  local dir daemon_pid watcher_pid watcher_identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-neutral-hosted-watch-empty")
+  record_session_lock "$dir"
+  mkdir -p "$dir/config"
+  : > "$dir/config/neutral-host-drain-path"
+  : > "$dir/state/task1.meta"
+  sleep 60 &
+  daemon_pid=$!
+  record_neutral_daemon "$dir" "$daemon_pid"
+  sleep 60 &
+  watcher_pid=$!
+  watcher_identity=$(watcher_identity "$dir" "$watcher_pid") || {
+    kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "could not identify acknowledged neutral-hosted watcher"
+  }
+  record_watcher_lock "$dir" "$watcher_pid" "$watcher_identity"
+  printf '%s\n' "$watcher_pid" > "$dir/state/.supervise-daemon.watcher.pid"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  expect_code 0 "$status" "hook must allow an acknowledged neutral daemon-hosted watcher when no queued wake needs delivery"
+  [ -z "$out" ] || fail "acknowledged neutral daemon-hosted watcher without queued wakes printed a block: $out"
+  pass "fm-turnend-guard: allows acknowledged neutral daemon-hosted watcher while the wake queue is empty"
 }
 
 test_hook_blocks_neutral_daemon_hosted_watcher_with_queue() {
   local dir daemon_pid watcher_pid watcher_identity out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-neutral-hosted-watch-queue")
   record_session_lock "$dir"
+  mkdir -p "$dir/config"
+  : > "$dir/config/neutral-host-drain-path"
   : > "$dir/state/task1.meta"
   printf 'record\n' > "$dir/state/.wake-queue"
   sleep 60 &
@@ -578,6 +610,71 @@ test_hook_blocks_neutral_daemon_hosted_watcher_with_queue() {
   assert_contains "$out" 'watcher is daemon-hosted in mode=neutral without verified away-mode ownership' "neutral daemon-hosted watcher block must explain missing wake delivery"
   assert_contains "$out" 'Stop the watcher host, or re-enter /afk' "neutral daemon-hosted watcher block must give repair"
   pass "fm-turnend-guard: blocks neutral daemon-hosted watcher only when queued wakes need delivery"
+}
+
+test_hook_neutral_daemon_queue_only_banner_names_queue_delivery() {
+  local dir daemon_pid watcher_pid watcher_identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-neutral-hosted-watch-queue-only")
+  record_session_lock "$dir"
+  mkdir -p "$dir/config"
+  : > "$dir/config/neutral-host-drain-path"
+  printf 'record\n' > "$dir/state/.wake-queue"
+  sleep 60 &
+  daemon_pid=$!
+  record_neutral_daemon "$dir" "$daemon_pid"
+  sleep 60 &
+  watcher_pid=$!
+  watcher_identity=$(watcher_identity "$dir" "$watcher_pid") || {
+    kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "could not identify queue-only neutral-hosted watcher"
+  }
+  record_watcher_lock "$dir" "$watcher_pid" "$watcher_identity"
+  printf '%s\n' "$watcher_pid" > "$dir/state/.supervise-daemon.watcher.pid"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(run_hook "$dir" false); status=$?
+  kill "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  expect_code 2 "$status" "hook must block queued wakes under an acknowledged neutral daemon-hosted watcher"
+  assert_contains "$out" 'Queued wakes cannot reach this session because the watcher is daemon-hosted in mode=neutral' "queue-only daemon block must name queued wake delivery"
+  assert_not_contains "$out" '0 task(s) in flight' "queue-only daemon block must not cite zero in-flight tasks"
+  pass "fm-turnend-guard: queue-only neutral daemon block names queued wake delivery"
+}
+
+test_hook_skips_neutral_daemon_queue_block_under_foreign_session_lock() {
+  local dir daemon_pid watcher_pid watcher_identity lock_pid out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-neutral-hosted-watch-foreign-lock")
+  mkdir -p "$dir/config"
+  : > "$dir/config/neutral-host-drain-path"
+  printf 'record\n' > "$dir/state/.wake-queue"
+  bash -c 'exec -a claude sleep 60' &
+  lock_pid=$!
+  printf '%s\n' "$lock_pid" > "$dir/state/.lock"
+  sleep 60 &
+  daemon_pid=$!
+  record_neutral_daemon "$dir" "$daemon_pid"
+  sleep 60 &
+  watcher_pid=$!
+  watcher_identity=$(watcher_identity "$dir" "$watcher_pid") || {
+    kill "$lock_pid" "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+    wait "$lock_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    fail "could not identify neutral-hosted watcher under foreign lock"
+  }
+  record_watcher_lock "$dir" "$watcher_pid" "$watcher_identity"
+  printf '%s\n' "$watcher_pid" > "$dir/state/.supervise-daemon.watcher.pid"
+  touch "$dir/state/.last-watcher-beat"
+  out=$(FM_TURNEND_HARNESS_PID_OVERRIDE=$$ run_hook "$dir" false); status=$?
+  kill "$lock_pid" "$daemon_pid" "$watcher_pid" 2>/dev/null || true
+  wait "$lock_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  wait "$watcher_pid" 2>/dev/null || true
+  expect_code 0 "$status" "read-only hook must leave queued neutral-host wakes for the foreign lock holder"
+  [ -z "$out" ] || fail "foreign-lock neutral hosted queue block printed output: $out"
+  pass "fm-turnend-guard: skips neutral daemon queue block under a live foreign session lock"
 }
 
 test_hook_combines_queue_and_watcher_blocks() {
@@ -1277,8 +1374,11 @@ test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
 test_hook_blocks_when_queue_pending_with_live_lock
 test_hook_blocks_watcher_gap_with_live_away_daemon
-test_hook_allows_neutral_daemon_hosted_watcher_until_queue_pending
+test_hook_blocks_neutral_daemon_hosted_watcher_without_drain_ack
+test_hook_allows_neutral_daemon_hosted_watcher_with_drain_ack_until_queue_pending
 test_hook_blocks_neutral_daemon_hosted_watcher_with_queue
+test_hook_neutral_daemon_queue_only_banner_names_queue_delivery
+test_hook_skips_neutral_daemon_queue_block_under_foreign_session_lock
 test_hook_combines_queue_and_watcher_blocks
 test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_blocks_when_unhealthy_in_primary

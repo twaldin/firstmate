@@ -121,6 +121,7 @@ AWAY_DAEMON_ACTIVE=false
 AWAY_SUPERVISION_HEALTHY=false
 DAEMON_DELIVERY_GAP=false
 DAEMON_DELIVERY_GAP_MODE=
+NEUTRAL_HOST_DRAIN_ACK=false
 fm_away_daemon_owns_catchup "$STATE" && AWAY_DAEMON_ACTIVE=true
 if [ "$AWAY_DAEMON_ACTIVE" = true ] && fm_away_supervision_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" "$FM_SUP_WATCHER_FRESH"; then
   AWAY_SUPERVISION_HEALTHY=true
@@ -129,6 +130,7 @@ if fm_daemon_hosted_watcher_without_delivery "$STATE" "$WATCH" "$GRACE" "$FM_HOM
   DAEMON_DELIVERY_GAP=true
   DAEMON_DELIVERY_GAP_MODE=$FM_DAEMON_HOSTED_WATCHER_MODE
 fi
+[ -f "$CONFIG/neutral-host-drain-path" ] && NEUTRAL_HOST_DRAIN_ACK=true
 
 if [ "$AWAY_DAEMON_ACTIVE" = true ] && [ "$AWAY_SUPERVISION_HEALTHY" != true ] \
    && { [ "$FM_SUP_QUEUE_PENDING" = true ] || [ "$FM_SUP_IN_FLIGHT" -gt 0 ]; }; then
@@ -138,8 +140,9 @@ if [ "$FM_SUP_QUEUE_PENDING" = true ] && [ "$AWAY_SUPERVISION_HEALTHY" != true ]
   QUEUE_BLOCK=true
 fi
 if [ "$DAEMON_DELIVERY_GAP" = true ] && {
-     [ "$FM_SUP_QUEUE_PENDING" = true ] \
-       || { [ "$DAEMON_DELIVERY_GAP_MODE" = away ] && [ "$FM_SUP_IN_FLIGHT" -gt 0 ]; }
+     [ "$QUEUE_BLOCK" = true ] \
+       || { [ "$DAEMON_DELIVERY_GAP_MODE" = away ] && [ "$FM_SUP_IN_FLIGHT" -gt 0 ]; } \
+       || { [ "$DAEMON_DELIVERY_GAP_MODE" != away ] && [ "$NEUTRAL_HOST_DRAIN_ACK" != true ] && [ "$FM_SUP_IN_FLIGHT" -gt 0 ]; }
    }; then
   WATCH_BLOCK=daemon
 elif [ "$FM_SUP_IN_FLIGHT" -gt 0 ] && [ "$AWAY_DAEMON_ACTIVE" != true ] && ! fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
@@ -171,8 +174,13 @@ if [ "$QUEUE_BLOCK" = true ] || [ "$WATCH_BLOCK" != false ]; then
     elif [ "$WATCH_BLOCK" = away ]; then
       printf '●  %s\n' "$AWAY_REASON"
     elif [ "$WATCH_BLOCK" = daemon ]; then
-      printf '●  %s task(s) in flight, but the watcher is daemon-hosted in mode=%s without verified away-mode ownership.\n' "$FM_SUP_IN_FLIGHT" "$DAEMON_DELIVERY_GAP_MODE"
-      printf '●  Stop the watcher host, or re-enter /afk if away mode should own delivery, then run bin/fm-watch-arm.sh as the harness-tracked background task before ending the turn.\n'
+      if [ "$QUEUE_BLOCK" = true ] && [ "$FM_SUP_IN_FLIGHT" -eq 0 ]; then
+        printf '●  Queued wakes cannot reach this session because the watcher is daemon-hosted in mode=%s without verified away-mode ownership.\n' "$DAEMON_DELIVERY_GAP_MODE"
+        printf '●  Stop the watcher host or re-enter /afk if away mode should own delivery, then drain state/.wake-queue before ending the turn.\n'
+      else
+        printf '●  %s task(s) in flight, but the watcher is daemon-hosted in mode=%s without verified away-mode ownership.\n' "$FM_SUP_IN_FLIGHT" "$DAEMON_DELIVERY_GAP_MODE"
+        printf '●  Stop the watcher host, or re-enter /afk if away mode should own delivery, then run bin/fm-watch-arm.sh as the harness-tracked background task before ending the turn.\n'
+      fi
     fi
     printf '●%s\n' "$rule"
   } >&2

@@ -93,6 +93,15 @@ daemon_pid_matches() {
   [ "$current" = "$identity" ]
 }
 
+daemon_pid_command_matches() {
+  local pid=$1 command
+  command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+  case "$command" in
+    *"$FM_AFK_DAEMON"*|*"fm-supervise-daemon.sh"*) return 0 ;;
+  esac
+  return 1
+}
+
 daemon_lock_pid() {
   local owner
   owner=$(daemon_lock_owner) || return 1
@@ -100,11 +109,16 @@ daemon_lock_pid() {
 }
 
 daemon_lock_held_by_live_daemon() {
-  local owner pid
+  local owner pid identity
   owner=$(daemon_lock_owner) || return 1
   pid=$(cat "$owner/pid" 2>/dev/null || true)
   fm_pid_alive "$pid" || return 1
-  daemon_pid_matches "$pid" "$owner" || return 1
+  identity=$(cat "$owner/pid-identity" 2>/dev/null || true)
+  if [ -n "$identity" ]; then
+    daemon_pid_matches "$pid" "$owner" || return 1
+  else
+    daemon_pid_command_matches "$pid" || return 1
+  fi
   [ "$(cat "$FM_AFK_STATE/.supervise-daemon.mode" 2>/dev/null || true)" = away ]
 }
 
@@ -116,6 +130,27 @@ daemon_lock_held_by_live_any_daemon() {
   daemon_pid_matches "$pid" "$owner"
 }
 
+daemon_lock_has_reused_pid() {
+  local owner pid identity
+  owner=$(daemon_lock_owner) || return 1
+  pid=$(cat "$owner/pid" 2>/dev/null || true)
+  fm_pid_alive "$pid" || return 1
+  identity=$(cat "$owner/pid-identity" 2>/dev/null || true)
+  [ -n "$identity" ] || return 1
+  daemon_pid_matches "$pid" "$owner" && return 1
+  return 0
+}
+
+daemon_lock_held_by_live_ambiguous_daemon() {
+  local owner pid identity
+  owner=$(daemon_lock_owner) || return 1
+  pid=$(cat "$owner/pid" 2>/dev/null || true)
+  fm_pid_alive "$pid" || return 1
+  identity=$(cat "$owner/pid-identity" 2>/dev/null || true)
+  [ -z "$identity" ] || return 1
+  daemon_pid_command_matches "$pid"
+}
+
 daemon_wait_for_stop() {
   local pid=$1 i=0
   while fm_pid_alive "$pid" && [ "$i" -lt 50 ]; do
@@ -123,6 +158,11 @@ daemon_wait_for_stop() {
     i=$((i + 1))
   done
   ! fm_pid_alive "$pid"
+}
+
+fm_afk_start_clear_fresh_flag() {
+  [ "${FM_AFK_STATE_PREPARED:-0}" = 1 ] && return 0
+  rm -f "$FM_AFK_STATE/.afk" 2>/dev/null || true
 }
 
 fm_afk_start_main() {
@@ -151,9 +191,14 @@ fm_afk_start_main() {
     kill "$pid" 2>/dev/null || true
     if ! daemon_wait_for_stop "$pid"; then
       echo "afk: live supervise daemon pid=$pid did not stop" >&2
+      fm_afk_start_clear_fresh_flag
       return 1
     fi
-  elif fm_pid_alive "$pid" && [ -n "$pid" ]; then
+  elif daemon_lock_held_by_live_ambiguous_daemon; then
+    echo "afk: live supervise daemon pid=$pid has no lock identity; stop it before entering away mode" >&2
+    fm_afk_start_clear_fresh_flag
+    return 1
+  elif daemon_lock_has_reused_pid; then
     fm_lock_remove_path "$FM_AFK_LOCK" 2>/dev/null || true
   fi
 

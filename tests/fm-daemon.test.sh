@@ -64,6 +64,14 @@ stop_daemon_pid() {
   wait "$pid" 2>/dev/null || true
 }
 
+FAKE_DAEMON_PID=
+start_fake_daemon_process() {
+  local dir=$1
+  ln -sf /bin/sleep "$dir/fm-supervise-daemon.sh"
+  "$dir/fm-supervise-daemon.sh" 60 &
+  FAKE_DAEMON_PID=$!
+}
+
 test_afk_start_refuses_when_flag_cannot_be_written() {
   local dir state out status
   dir=$(make_supercase afk-start-flag-unwritable)
@@ -116,6 +124,56 @@ test_afk_start_reclaims_stale_daemon_lock_reused_pid() {
   assert_not_contains "$out" "another fm-supervise-daemon is already running" "daemon singleton lock still trusted the reused pid"
   assert_absent "$state/.afk" "fm-afk-start.sh left .afk after stale-lock startup validation failed"
   pass "fm-afk-start.sh reclaims stale daemon locks whose live pid identity no longer matches"
+}
+
+test_afk_start_keeps_identityless_live_away_daemon() {
+  local dir state out status owner pid
+  dir=$(make_supercase afk-start-legacy-away-lock)
+  state="$dir/state"
+  start_fake_daemon_process "$dir"
+  pid=$FAKE_DAEMON_PID
+  owner="$state/.supervise-daemon.lock.owner.legacy"
+  mkdir -p "$owner"
+  printf '%s\n' "$pid" > "$owner/pid"
+  ln -s "$owner" "$state/.supervise-daemon.lock"
+  printf '%s\n' "$pid" > "$state/.supervise-daemon.pid"
+  printf 'away\n' > "$state/.supervise-daemon.mode"
+
+  out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1)
+  status=$?
+
+  stop_daemon_pid "$pid"
+  [ "$status" -eq 0 ] || fail "fm-afk-start.sh rejected a legacy identityless live away daemon: $out"
+  assert_contains "$out" "daemon already running" "fm-afk-start.sh did not treat the legacy live away daemon as running"
+  assert_not_contains "$out" "starting supervise daemon" "fm-afk-start.sh attempted duplicate startup under a legacy live away daemon"
+  [ -L "$state/.supervise-daemon.lock" ] || fail "fm-afk-start.sh removed a legacy live away daemon lock"
+  [ -e "$state/.afk" ] || fail "fm-afk-start.sh did not refresh .afk for a legacy live away daemon"
+  pass "fm-afk-start.sh preserves a legacy identityless live away daemon lock"
+}
+
+test_afk_start_refuses_identityless_live_neutral_daemon() {
+  local dir state out status owner pid
+  dir=$(make_supercase afk-start-legacy-neutral-lock)
+  state="$dir/state"
+  start_fake_daemon_process "$dir"
+  pid=$FAKE_DAEMON_PID
+  owner="$state/.supervise-daemon.lock.owner.legacy-neutral"
+  mkdir -p "$owner"
+  printf '%s\n' "$pid" > "$owner/pid"
+  ln -s "$owner" "$state/.supervise-daemon.lock"
+  printf '%s\n' "$pid" > "$state/.supervise-daemon.pid"
+  printf 'neutral\n' > "$state/.supervise-daemon.mode"
+
+  out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1)
+  status=$?
+
+  stop_daemon_pid "$pid"
+  [ "$status" -ne 0 ] || fail "fm-afk-start.sh replaced an identityless live neutral daemon"
+  assert_contains "$out" "has no lock identity" "fm-afk-start.sh did not explain the ambiguous live neutral daemon"
+  assert_not_contains "$out" "starting supervise daemon" "fm-afk-start.sh attempted duplicate startup under an ambiguous live neutral daemon"
+  [ -L "$state/.supervise-daemon.lock" ] || fail "fm-afk-start.sh removed an ambiguous live neutral daemon lock"
+  assert_absent "$state/.afk" "fm-afk-start.sh left a fresh .afk after refusing an ambiguous neutral daemon"
+  pass "fm-afk-start.sh refuses, without reclaiming, an identityless live neutral daemon"
 }
 
 test_daemon_state_root_uses_fm_home() {
@@ -2403,6 +2461,8 @@ test_away_mode_flag_keeps_daemon_injection_path() {
 test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
+test_afk_start_keeps_identityless_live_away_daemon
+test_afk_start_refuses_identityless_live_neutral_daemon
 test_daemon_state_root_uses_fm_home
 test_classify_routine_signal_self
 test_classify_terminal_signal_escalates

@@ -67,6 +67,8 @@ test_harness_pid_preserves_node_args_fallback() {
     || fail "node claude-code script path was not recognized as a harness"
   run_harness_pid_case /usr/bin/node 'node --enable-source-maps /opt/codex/cli.js' \
     || fail "node codex script path after a flag was not recognized as a harness"
+  run_harness_pid_case /usr/bin/node 'node /opt/pi/bin/pi --model default' \
+    || fail "node pi script path was not recognized as a harness"
   pass "fm_session_harness_pid preserves node/python args-wide harness detection"
 }
 
@@ -79,7 +81,9 @@ test_holder_alive_matches_exec_argv0_harness() {
 test_holder_alive_matches_pi_basename() {
   run_holder_alive_case /usr/local/bin/pi 'pi --model default' \
     || fail "bare pi basename was not recognized as a live holder"
-  pass "fm_session_holder_alive recognizes a bare pi holder"
+  run_holder_alive_case /usr/bin/node 'node /opt/pi/bin/pi --model default' \
+    || fail "node-launched pi args were not recognized as a live holder"
+  pass "fm_session_holder_alive recognizes pi basename and node-launched pi holders"
 }
 
 test_holder_alive_rejects_non_harness_process() {

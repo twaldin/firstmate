@@ -108,6 +108,7 @@ fm_lock_is_provably_stale() {
 
 # Known harness command names; extend when a new adapter is verified.
 FM_SESSION_HARNESS_RE='claude|codex|opencode|grok|^pi$'
+FM_SESSION_HARNESS_ARGS_RE='claude|codex|opencode|grok|(^|/)pi([[:space:]]|$)'
 
 fm_session_basename() {
   basename -- "$1" 2>/dev/null || printf '%s\n' "$1"
@@ -128,7 +129,7 @@ fm_session_harness_pid() {
     # Preserve the historical interpreter fallback: node/python launchers often
     # hide the harness name in the CLI script path rather than argv[0].
     case "$comm" in
-      *node*|*python*) printf '%s' "$args" | grep -qE "$FM_SESSION_HARNESS_RE" && { echo "$pid"; return 0; } ;;
+      *node*|*python*) printf '%s' "$args" | grep -qE "$FM_SESSION_HARNESS_ARGS_RE" && { echo "$pid"; return 0; } ;;
     esac
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
     [ -n "$pid" ] && [ "$pid" -gt 1 ] || return 1
@@ -141,5 +142,5 @@ fm_session_holder_alive() {
   kill -0 "$pid" 2>/dev/null || return 1
   comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
   args=$(ps -o args= -p "$pid" 2>/dev/null)
-  fm_session_harness_name_matches "$comm" || printf '%s' "$args" | grep -qE "$FM_SESSION_HARNESS_RE"
+  fm_session_harness_name_matches "$comm" || printf '%s' "$args" | grep -qE "$FM_SESSION_HARNESS_ARGS_RE"
 }
