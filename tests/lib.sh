@@ -58,12 +58,68 @@ pass() {
 # call fm_test_cleanup from inside it so registered dirs are still removed.
 
 FM_TEST_CLEANUP_DIRS=()
+FM_TEST_CLEANUP_PIDS=()
+
+fm_test_register_pid() {
+  local pid=$1
+  case "$pid" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  FM_TEST_CLEANUP_PIDS+=("$pid")
+}
+
+fm_test_unregister_pid() {
+  local target=$1 pid next=()
+  for pid in "${FM_TEST_CLEANUP_PIDS[@]:-}"; do
+    [ "$pid" = "$target" ] && continue
+    next+=("$pid")
+  done
+  FM_TEST_CLEANUP_PIDS=("${next[@]}")
+}
+
+fm_test_reap_registered_pids() {
+  local pid i live survivor_status=0
+  for pid in "${FM_TEST_CLEANUP_PIDS[@]:-}"; do
+    [ -n "$pid" ] || continue
+    kill "$pid" 2>/dev/null || true
+  done
+  i=0
+  while [ "$i" -lt 20 ]; do
+    live=0
+    for pid in "${FM_TEST_CLEANUP_PIDS[@]:-}"; do
+      [ -n "$pid" ] || continue
+      kill -0 "$pid" 2>/dev/null && live=$((live + 1))
+    done
+    [ "$live" -eq 0 ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  for pid in "${FM_TEST_CLEANUP_PIDS[@]:-}"; do
+    [ -n "$pid" ] || continue
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  done
+  for pid in "${FM_TEST_CLEANUP_PIDS[@]:-}"; do
+    [ -n "$pid" ] || continue
+    wait "$pid" 2>/dev/null || true
+  done
+  for pid in "${FM_TEST_CLEANUP_PIDS[@]:-}"; do
+    [ -n "$pid" ] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      printf 'not ok - registered test process survived cleanup: pid %s\n' "$pid" >&2
+      survivor_status=1
+    fi
+  done
+  FM_TEST_CLEANUP_PIDS=()
+  return "$survivor_status"
+}
 
 fm_test_cleanup() {
-  local d
+  local d cleanup_status=0
+  fm_test_reap_registered_pids || cleanup_status=$?
   for d in "${FM_TEST_CLEANUP_DIRS[@]:-}"; do
     [ -n "$d" ] && rm -rf "$d"
   done
+  return "$cleanup_status"
 }
 
 fm_test_tmproot() {

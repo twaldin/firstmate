@@ -117,10 +117,16 @@ fm_lock_abs_path() {
   printf '%s/%s\n' "$dir" "$base"
 }
 
-fm_lock_owner_dir() {
-  local lockdir=$1 lock_abs
+fm_lock_sidecar_path() {
+  local lockdir=$1 suffix=$2 lock_abs
   lock_abs=$(fm_lock_abs_path "$lockdir") || return 1
-  mktemp -d "${lock_abs}.owner.XXXXXX" 2>/dev/null
+  printf '%s%s\n' "$lock_abs" "$suffix"
+}
+
+fm_lock_owner_dir() {
+  local lockdir=$1 owner_base
+  owner_base=$(fm_lock_sidecar_path "$lockdir" ".owner") || return 1
+  mktemp -d "${owner_base}.XXXXXX" 2>/dev/null
 }
 
 fm_lock_prepare_owner() {
@@ -164,12 +170,19 @@ fm_lock_remove_stray_owner_link() {
 
 fm_lock_claim_blocked_by_steal() {
   local lockdir=$1 allowed_steal_owner=${2:-} steal
-  steal="$lockdir.steal"
+  steal=$(fm_lock_sidecar_path "$lockdir" ".steal") || return 1
   [ -e "$steal" ] || [ -L "$steal" ] || return 1
   if [ -n "$allowed_steal_owner" ] && fm_lock_points_to_owner "$steal" "$allowed_steal_owner"; then
     return 1
   fi
   return 0
+}
+
+fm_lock_publish_owner() {
+  local lockdir=$1 ownerdir=$2
+  # -n is supported by both BSD and GNU ln and prevents a just-created
+  # symlink-to-directory lock from being followed as the destination directory.
+  ln -s -n "$ownerdir" "$lockdir" 2>/dev/null
 }
 
 fm_lock_claim() {
@@ -210,7 +223,7 @@ fm_lock_try_create() {
     fm_lock_discard_owner "$ownerdir"
     return 1
   fi
-  if ln -s "$ownerdir" "$lockdir" 2>/dev/null && fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
+  if fm_lock_publish_owner "$lockdir" "$ownerdir" && fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
     if fm_lock_claim "$lockdir" "$ownerdir" "$allowed_steal_owner"; then
       FM_LOCK_OWNER_DIR=$ownerdir
       return 0
@@ -287,7 +300,7 @@ fm_lock_try_acquire() {
     return 1
   fi
 
-  steal="$lockdir.steal"
+  steal=$(fm_lock_sidecar_path "$lockdir" ".steal") || return 1
   if ! fm_lock_try_acquire "$steal"; then
     FM_LOCK_HELD_PID=$(cat "$lockdir/pid" 2>/dev/null || true)
     FM_LOCK_OWNER_DIR=

@@ -37,6 +37,7 @@ watch_bg() {  # <state> <fakebin> <out> [extra env assignments...]
   shift 3
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$@" "$WATCH" > "$out" &
+  fm_test_register_pid "$!"
 }
 
 # Wait up to <limit> 0.1s ticks while <pid> stays alive; 0 if still alive, 1 if it died.
@@ -64,6 +65,26 @@ wait_numeric_file() {
   return 1
 }
 
+wait_nonempty_file() {
+  local file=$1 limit=${2:-30} i=0
+  while [ "$i" -lt "$limit" ]; do
+    [ -s "$file" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+wait_file_equals() {
+  local file=$1 expected=$2 limit=${3:-30} i=0
+  while [ "$i" -lt "$limit" ]; do
+    [ "$(cat "$file" 2>/dev/null || true)" = "$expected" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
 # Portable mtime in epoch seconds. Platform-detected, never the `stat -f || stat -c`
 # fallback (which writes a partial filesystem dump on Linux; see fm-watch.sh).
 file_mtime() {
@@ -76,7 +97,12 @@ seen_sig() {
   if [ "$(uname)" = Darwin ]; then stat -f '%z:%Fm' "$1" 2>/dev/null; else stat -c '%s:%Y' "$1" 2>/dev/null; fi
 }
 
-reap() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
+reap() {
+  kill "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
+  kill -0 "$1" 2>/dev/null && fail "test watcher survived reap: pid $1"
+  fm_test_unregister_pid "$1"
+}
 
 # --- pure classifier predicates (fm-classify-lib.sh) ------------------------
 
@@ -314,9 +340,9 @@ test_provably_working_signal_absorbed() {
   if ! wait_live "$pid" 30; then
     reap "$pid"; fail "watcher exited for a working: signal whose crew is provably working (should absorb): $(cat "$out")"
   fi
+  wait_nonempty_file "$state/.seen-task_status" 80 || { reap "$pid"; fail "provably-working signal did not advance its .seen-* suppressor"; }
   [ ! -s "$out" ] || fail "provably-working signal printed a wake reason: $(cat "$out")"
   [ ! -s "$state/.wake-queue" ] || fail "provably-working signal enqueued a durable wake record"
-  [ -s "$state/.seen-task_status" ] || fail "provably-working signal did not advance its .seen-* suppressor"
   [ -e "$state/.last-watcher-beat" ] || fail "watcher beacon was not touched while absorbing"
   reap "$pid"
   pass "a no-verb signal whose crew is provably working is absorbed (no exit, no queue, suppressor advanced, beacon present)"
@@ -460,10 +486,10 @@ test_stale_terminal_status_overridden_by_active_run() {
   if ! wait_live "$pid" 30; then
     reap "$pid"; fail "watcher exited for a stale terminal-looking status the run-step overrides (should absorb): $(cat "$out")"
   fi
+  wait_file_equals "$state/.stale-$key" "$pane_hash" 80 || { reap "$pid"; fail "stale suppressor not advanced on absorb"; }
+  wait_nonempty_file "$state/.stale-since-$key" 80 || { reap "$pid"; fail "stale-since escalation timer was not recorded on absorb"; }
   [ ! -s "$out" ] || fail "the overridden stale terminal status printed a wake reason during absorb"
   [ ! -s "$state/.wake-queue" ] || fail "the overridden stale terminal status enqueued a wake during absorb"
-  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on absorb"
-  [ -s "$state/.stale-since-$key" ] || fail "stale-since escalation timer was not recorded on absorb"
   [ ! -e "$state/.hb-surfaced-validating" ] || fail "an absorbed wake must not mark the status line as surfaced"
   reap "$pid"
 
@@ -513,10 +539,10 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated() {
   if ! wait_live "$pid" 30; then
     reap "$pid"; fail "watcher exited for a fresh provably-working non-terminal stale (should absorb): $(cat "$out")"
   fi
+  wait_file_equals "$state/.stale-$key" "$pane_hash" 80 || { reap "$pid"; fail "stale suppressor not advanced on absorb"; }
+  wait_nonempty_file "$state/.stale-since-$key" 80 || { reap "$pid"; fail "stale-since escalation timer was not recorded on absorb"; }
   [ ! -s "$out" ] || fail "fresh provably-working stale printed a wake reason during absorb"
   [ ! -s "$state/.wake-queue" ] || fail "fresh provably-working stale enqueued a wake during absorb"
-  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on absorb"
-  [ -s "$state/.stale-since-$key" ] || fail "stale-since escalation timer was not recorded on absorb"
   reap "$pid"
 
   # Phase B: backdate the idle timer past the threshold; the next run escalates.
@@ -612,9 +638,9 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
   if ! wait_live "$pid" 30; then
     reap "$pid"; fail "watcher exited for a fresh declared pause (should absorb): $(cat "$out")"
   fi
+  wait_file_equals "$state/.stale-$key" "$pane_hash" 80 || { reap "$pid"; fail "stale suppressor not advanced on paused absorb"; }
   [ ! -s "$out" ] || fail "fresh paused stale printed a wake reason during absorb"
   [ ! -s "$state/.wake-queue" ] || fail "fresh paused stale enqueued a wake during absorb"
-  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on paused absorb"
   [ -e "$state/.paused-$key" ] || fail "paused flag not recorded on absorb"
   [ ! -e "$state/.stale-since-$key" ] || fail "a paused absorb must not start the wedge timer"
   reap "$pid"
@@ -675,7 +701,7 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
       FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
     pid=$!
-    if wait_live "$pid" 15; then reap "$pid"; else wait "$pid" || fail "dead-agent watcher round $round failed"; fi
+    if wait_live "$pid" 50; then reap "$pid"; else wait "$pid" || fail "dead-agent watcher round $round failed"; fi
     round=$((round + 1))
   done
   wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")

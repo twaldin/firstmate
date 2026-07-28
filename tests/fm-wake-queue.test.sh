@@ -16,6 +16,41 @@ DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
 TMP_ROOT=$(fm_test_tmproot fm-wake-tests)
 
+wait_for_concurrent_pids() {
+  local label=$1 limit=$2 pids=$3 i pid live
+  i=0
+  while [ "$i" -lt "$limit" ]; do
+    live=0
+    for pid in $pids; do
+      kill -0 "$pid" 2>/dev/null && live=$((live + 1))
+    done
+    [ "$live" -eq 0 ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [ "$live" -ne 0 ]; then
+    for pid in $pids; do
+      kill "$pid" 2>/dev/null || true
+    done
+    for pid in $pids; do
+      wait "$pid" 2>/dev/null || true
+    done
+    fail "$label subprocesses did not finish (live=$live)"
+  fi
+  for pid in $pids; do
+    wait "$pid" || fail "$label subprocess failed"
+  done
+}
+
+assert_no_wake_lock_sidecar_nesting() {
+  local state=$1 nested
+  nested=$(find "$state" \( \
+    -path "$state/.wake-queue.lock.owner.*/*.wake-queue.lock.owner.*" -o \
+    -path "$state/.wake-queue.lock.steal.owner.*/*.wake-queue.lock.steal.owner.*" -o \
+    -name '.wake-queue.lock.steal.steal*' \
+  \) -print 2>/dev/null | head -20)
+  [ -z "$nested" ] || fail "wake queue lock sidecars nested under owner dirs: $nested"
+}
 
 test_concurrent_append_and_drain() {
   local dir state out1 out2 all pids i pid count unique malformed
@@ -33,10 +68,10 @@ test_concurrent_append_and_drain() {
   done
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out1" &
   pids="$pids $!"
-  for pid in $pids; do
-    wait "$pid" || fail "concurrent append/drain subprocess failed"
-  done
+  wait_for_concurrent_pids "concurrent append/drain" 200 "$pids"
+  assert_no_wake_lock_sidecar_nesting "$state"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$out2" || fail "final drain failed"
+  assert_no_wake_lock_sidecar_nesting "$state"
   cat "$out1" "$out2" > "$all"
   count=$(awk 'NF { count++ } END { print count + 0 }' "$all")
   [ "$count" -eq 40 ] || fail "expected 40 drained records, got $count"
