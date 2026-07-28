@@ -180,6 +180,9 @@ if [ "$QUEUE_BLOCK" = true ] || [ "$WATCH_BLOCK" != false ]; then
       else
         printf '●  %s task(s) in flight, but the watcher is daemon-hosted in mode=%s without verified away-mode ownership.\n' "$FM_SUP_IN_FLIGHT" "$DAEMON_DELIVERY_GAP_MODE"
         printf '●  Stop the watcher host, or re-enter /afk if away mode should own delivery, then run bin/fm-watch-arm.sh as the harness-tracked background task before ending the turn.\n'
+        if [ "$DAEMON_DELIVERY_GAP_MODE" != away ]; then
+          printf '●  If another configured path drains state/.wake-queue for this home, create config/neutral-host-drain-path to acknowledge that neutral-host contract.\n'
+        fi
       fi
     fi
     printf '●%s\n' "$rule"

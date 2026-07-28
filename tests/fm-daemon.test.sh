@@ -62,14 +62,63 @@ stop_daemon_pid() {
   [ -n "$pid" ] || return 0
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
+  fm_test_unregister_pid "$pid"
+}
+
+stop_external_pid() {
+  local pid=$1 i=0
+  [ -n "$pid" ] || return 0
+  kill "$pid" 2>/dev/null || true
+  while [ "$i" -lt 30 ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  i=0
+  while [ "$i" -lt 30 ] && kill -0 "$pid" 2>/dev/null; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  ! kill -0 "$pid" 2>/dev/null
+}
+
+assert_external_pid_stopped() {
+  local pid=$1 label=$2
+  stop_external_pid "$pid" || fail "$label survived teardown: pid $pid"
+  fm_test_unregister_pid "$pid"
+}
+
+daemon_suite_watchers() {
+  ps eww -axo pid=,command= 2>/dev/null \
+    | awk -v watch="$WATCH" -v tmp="$TMP_ROOT" 'index($0, watch) && index($0, "FM_STATE_OVERRIDE=" tmp) { print }'
+}
+
+test_daemon_suite_reaps_hosted_watchers() {
+  local survivors
+  survivors=$(daemon_suite_watchers)
+  [ -z "$survivors" ] || fail "daemon suite left watcher process(es): $survivors"
+  pass "daemon suite reaps hosted watcher processes"
 }
 
 FAKE_DAEMON_PID=
 start_fake_daemon_process() {
   local dir=$1
-  ln -sf /bin/sleep "$dir/fm-supervise-daemon.sh"
-  "$dir/fm-supervise-daemon.sh" 60 &
+  shift
+  cat > "$dir/fm-supervise-daemon.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 60
+SH
+  chmod +x "$dir/fm-supervise-daemon.sh"
+  "$dir/fm-supervise-daemon.sh" "$@" &
   FAKE_DAEMON_PID=$!
+  fm_test_register_pid "$FAKE_DAEMON_PID"
+}
+
+pid_identity_for_test() {
+  local state=$1 pid=$2
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$ROOT/bin/fm-wake-lib.sh" "$pid"
 }
 
 test_afk_start_refuses_when_flag_cannot_be_written() {
@@ -130,7 +179,7 @@ test_afk_start_keeps_identityless_live_away_daemon() {
   local dir state out status owner pid
   dir=$(make_supercase afk-start-legacy-away-lock)
   state="$dir/state"
-  start_fake_daemon_process "$dir"
+  start_fake_daemon_process "$dir" --away-mode
   pid=$FAKE_DAEMON_PID
   owner="$state/.supervise-daemon.lock.owner.legacy"
   mkdir -p "$owner"
@@ -155,7 +204,7 @@ test_afk_start_refuses_identityless_live_neutral_daemon() {
   local dir state out status owner pid
   dir=$(make_supercase afk-start-legacy-neutral-lock)
   state="$dir/state"
-  start_fake_daemon_process "$dir"
+  start_fake_daemon_process "$dir" --neutral-host
   pid=$FAKE_DAEMON_PID
   owner="$state/.supervise-daemon.lock.owner.legacy-neutral"
   mkdir -p "$owner"
@@ -174,6 +223,131 @@ test_afk_start_refuses_identityless_live_neutral_daemon() {
   [ -L "$state/.supervise-daemon.lock" ] || fail "fm-afk-start.sh removed an ambiguous live neutral daemon lock"
   assert_absent "$state/.afk" "fm-afk-start.sh left a fresh .afk after refusing an ambiguous neutral daemon"
   pass "fm-afk-start.sh refuses, without reclaiming, an identityless live neutral daemon"
+}
+
+test_afk_start_reclaims_identityless_lock_reused_by_non_daemon() {
+  local dir state out status owner pid
+  dir=$(make_supercase afk-start-legacy-reused-nondaemon)
+  state="$dir/state"
+  sleep 60 &
+  pid=$!
+  fm_test_register_pid "$pid"
+  owner="$state/.supervise-daemon.lock.owner.legacy-reused"
+  mkdir -p "$owner"
+  printf '%s\n' "$pid" > "$owner/pid"
+  ln -s "$owner" "$state/.supervise-daemon.lock"
+  printf '%s\n' "$pid" > "$state/.supervise-daemon.pid"
+  printf 'neutral\n' > "$state/.supervise-daemon.mode"
+
+  out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1)
+  status=$?
+
+  stop_daemon_pid "$pid"
+  [ "$status" -ne 0 ] || fail "fm-afk-start.sh unexpectedly succeeded after reclaiming a legacy non-daemon lock"
+  assert_contains "$out" "starting supervise daemon" "fm-afk-start.sh did not attempt startup after reclaiming the legacy non-daemon lock"
+  assert_contains "$out" "does not support supervisor backend 'unsupported'" "daemon startup did not reach backend validation after identityless reclaim"
+  assert_not_contains "$out" "another fm-supervise-daemon is already running" "identityless non-daemon lock was not reclaimed"
+  assert_absent "$state/.supervise-daemon.lock" "identityless non-daemon lock survived failed replacement startup"
+  assert_absent "$state/.afk" "fm-afk-start.sh left .afk after reclaiming an identityless non-daemon lock and failing startup"
+  pass "fm-afk-start.sh reclaims an identityless legacy lock whose live pid is not a daemon"
+}
+
+test_afk_start_reclaims_identityless_lock_with_daemon_name_as_argument() {
+  local dir state out status owner pid
+  dir=$(make_supercase afk-start-legacy-arg-false-positive)
+  state="$dir/state"
+  bash -c 'sleep 60' bash fm-supervise-daemon.sh --away-mode &
+  pid=$!
+  fm_test_register_pid "$pid"
+  owner="$state/.supervise-daemon.lock.owner.legacy-arg"
+  mkdir -p "$owner"
+  printf '%s\n' "$pid" > "$owner/pid"
+  ln -s "$owner" "$state/.supervise-daemon.lock"
+  printf '%s\n' "$pid" > "$state/.supervise-daemon.pid"
+  printf 'away\n' > "$state/.supervise-daemon.mode"
+
+  out=$(FM_STATE_OVERRIDE="$state" FM_SUPERVISOR_BACKEND=unsupported "$AFK_START" 2>&1)
+  status=$?
+
+  stop_daemon_pid "$pid"
+  [ "$status" -ne 0 ] || fail "fm-afk-start.sh unexpectedly succeeded after reclaiming a daemon-name-argument lock"
+  assert_contains "$out" "starting supervise daemon" "fm-afk-start.sh treated a daemon name in argv as a live daemon"
+  assert_not_contains "$out" "daemon already running" "fm-afk-start.sh trusted a daemon name outside argv0/script position"
+  assert_absent "$state/.afk" "fm-afk-start.sh left .afk after reclaiming a daemon-name-argument lock and failing startup"
+  pass "fm-afk-start.sh does not trust a daemon name that appears only as an argument"
+}
+
+test_daemon_prelock_startup_failure_preserves_existing_away_state() {
+  local dir state bin_copy pid identity out status
+  dir=$(make_supercase daemon-prelock-fail-preserve)
+  state="$dir/state"
+  bin_copy="$dir/bin-copy"
+  cp -R "$ROOT/bin" "$bin_copy"
+  chmod -x "$bin_copy/fm-watch.sh"
+  sleep 60 &
+  pid=$!
+  fm_test_register_pid "$pid"
+  identity=$(pid_identity_for_test "$state" "$pid") || {
+    stop_daemon_pid "$pid"
+    fail "could not identify existing daemon pid"
+  }
+  printf '%s\n' "$pid" > "$state/.supervise-daemon.pid"
+  printf '%s\n' "$identity" > "$state/.supervise-daemon.pid-identity"
+  printf 'away\n' > "$state/.supervise-daemon.mode"
+  date '+%s' > "$state/.afk"
+
+  out=$(FM_STATE_OVERRIDE="$state" FM_AFK_START_OWNS_FLAG=1 "$bin_copy/fm-supervise-daemon.sh" --away-mode 2>&1)
+  status=$?
+
+  stop_daemon_pid "$pid"
+  [ "$status" -ne 0 ] || fail "daemon startup unexpectedly succeeded with a non-executable watcher"
+  assert_contains "$out" "watcher not found or not executable" "pre-lock startup failure did not report the watcher problem"
+  [ "$(cat "$state/.supervise-daemon.pid" 2>/dev/null || true)" = "$pid" ] \
+    || fail "pre-lock startup failure removed existing daemon pid"
+  [ "$(cat "$state/.supervise-daemon.pid-identity" 2>/dev/null || true)" = "$identity" ] \
+    || fail "pre-lock startup failure removed existing daemon pid identity"
+  [ "$(cat "$state/.supervise-daemon.mode" 2>/dev/null || true)" = away ] \
+    || fail "pre-lock startup failure removed existing daemon mode"
+  [ -e "$state/.afk" ] || fail "pre-lock startup failure removed existing away flag"
+  pass "daemon pre-lock startup failure preserves existing live away daemon state"
+}
+
+test_daemon_lock_contention_preserves_existing_away_state() {
+  local dir state owner pid identity out status
+  dir=$(make_supercase daemon-lock-contention-preserve)
+  state="$dir/state"
+  sleep 60 &
+  pid=$!
+  fm_test_register_pid "$pid"
+  identity=$(pid_identity_for_test "$state" "$pid") || {
+    stop_external_pid "$pid" || true
+    fail "could not identify lock holder pid"
+  }
+  owner="$state/.supervise-daemon.lock.owner.live"
+  mkdir -p "$owner"
+  printf '%s\n' "$pid" > "$owner/pid"
+  printf '%s\n' "$identity" > "$owner/pid-identity"
+  ln -s "$owner" "$state/.supervise-daemon.lock"
+  printf '%s\n' "$pid" > "$state/.supervise-daemon.pid"
+  printf '%s\n' "$identity" > "$state/.supervise-daemon.pid-identity"
+  printf 'away\n' > "$state/.supervise-daemon.mode"
+  date '+%s' > "$state/.afk"
+
+  out=$(FM_STATE_OVERRIDE="$state" FM_AFK_START_OWNS_FLAG=1 "$DAEMON" --away-mode 2>&1)
+  status=$?
+
+  assert_external_pid_stopped "$pid" "existing away lock holder"
+  [ "$status" -ne 0 ] || fail "daemon startup unexpectedly succeeded despite lock contention"
+  assert_contains "$out" "another fm-supervise-daemon is already running" "lock-contention startup did not report singleton contention"
+  [ "$(cat "$state/.supervise-daemon.pid" 2>/dev/null || true)" = "$pid" ] \
+    || fail "lock-contention startup removed existing daemon pid"
+  [ "$(cat "$state/.supervise-daemon.pid-identity" 2>/dev/null || true)" = "$identity" ] \
+    || fail "lock-contention startup removed existing daemon pid identity"
+  [ "$(cat "$state/.supervise-daemon.mode" 2>/dev/null || true)" = away ] \
+    || fail "lock-contention startup removed existing daemon mode"
+  [ -e "$state/.afk" ] || fail "lock-contention startup removed existing away flag"
+  [ -L "$state/.supervise-daemon.lock" ] || fail "lock-contention startup removed existing daemon lock"
+  pass "daemon lock contention preserves existing live away daemon state and .afk"
 }
 
 test_daemon_state_root_uses_fm_home() {
@@ -2115,6 +2289,7 @@ test_away_mode_takes_over_existing_plain_watcher() {
     FM_CHECK_INTERVAL=999999 \
     "$DAEMON" --away-mode >"$daemon_out" 2>"$daemon_err" &
   daemon_pid=$!
+  fm_test_register_pid "$daemon_pid"
 
   i=0
   while [ "$i" -lt 80 ] && kill -0 "$plain_pid" 2>/dev/null; do
@@ -2176,6 +2351,7 @@ test_away_mode_reclaims_runtime_watcher_lock_drift() {
     FM_CHECK_INTERVAL=999999 \
     "$DAEMON" --away-mode >"$daemon_out" 2>"$daemon_err" &
   daemon_pid=$!
+  fm_test_register_pid "$daemon_pid"
 
   i=0
   while [ "$i" -lt 100 ]; do
@@ -2190,6 +2366,7 @@ test_away_mode_reclaims_runtime_watcher_lock_drift() {
     stop_daemon_pid "$daemon_pid"
     fail "away daemon did not establish a hosted watcher before drift test; stderr=$(cat "$daemon_err" 2>/dev/null); log=$(cat "$state/.supervise-daemon.log" 2>/dev/null)"
   fi
+  fm_test_register_pid "$hosted_pid"
 
   kill "$hosted_pid" 2>/dev/null || true
   i=0
@@ -2237,6 +2414,7 @@ test_away_mode_reclaims_runtime_watcher_lock_drift() {
     kill "$plain_pid" 2>/dev/null || true
   fi
   wait "$plain_pid" 2>/dev/null || true
+  fm_test_unregister_pid "$hosted_pid"
 
   [ "$plain_live" -eq 0 ] || fail "away daemon did not kill a same-home watcher that stole ownership"
   grep -F "away mode reclaiming watcher ownership from pid $plain_pid" "$state/.supervise-daemon.log" >/dev/null \
@@ -2276,6 +2454,7 @@ test_away_mode_retries_unreclaimable_runtime_watcher_lock_drift() {
     FM_CHECK_INTERVAL=999999 \
     "$DAEMON" --away-mode >"$daemon_out" 2>"$daemon_err" &
   daemon_pid=$!
+  fm_test_register_pid "$daemon_pid"
 
   i=0
   while [ "$i" -lt 100 ]; do
@@ -2290,9 +2469,11 @@ test_away_mode_retries_unreclaimable_runtime_watcher_lock_drift() {
     stop_daemon_pid "$daemon_pid"
     fail "away daemon did not establish a hosted watcher before unreclaimable drift test; stderr=$(cat "$daemon_err" 2>/dev/null); log=$(cat "$state/.supervise-daemon.log" 2>/dev/null)"
   fi
+  fm_test_register_pid "$hosted_pid"
 
   sleep 60 &
   foreign_pid=$!
+  fm_test_register_pid "$foreign_pid"
   foreign_identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$ROOT/bin/fm-wake-lib.sh" "$foreign_pid") || {
     stop_daemon_pid "$daemon_pid"
     kill "$foreign_pid" 2>/dev/null || true
@@ -2316,9 +2497,10 @@ test_away_mode_retries_unreclaimable_runtime_watcher_lock_drift() {
     wait "$foreign_pid" 2>/dev/null || true
     fail "away daemon exited instead of staying alive to retry unreclaimable ownership drift"
   }
-  grep -F "away-mode daemon lost watcher ownership" "$state/.subsuper-escalations" >/dev/null \
-    || grep -F "away-mode daemon lost watcher ownership" "$sent" >/dev/null \
-    || fail "away daemon did not buffer or inject an ownership-loss escalation: buffer=$(cat "$state/.subsuper-escalations" 2>/dev/null); sent=$(cat "$sent" 2>/dev/null)"
+  if ! wait_for_file_contains "$state/.subsuper-escalations" "away-mode daemon lost watcher ownership" 80 \
+     && ! wait_for_file_contains "$sent" "away-mode daemon lost watcher ownership" 80; then
+    fail "away daemon did not buffer or inject an ownership-loss escalation: buffer=$(cat "$state/.subsuper-escalations" 2>/dev/null); sent=$(cat "$sent" 2>/dev/null)"
+  fi
   if ! wait_for_file_contains "$state/.supervise-daemon.log" "suppressing duplicate" 120; then
     stop_daemon_pid "$daemon_pid"
     kill "$foreign_pid" 2>/dev/null || true
@@ -2330,6 +2512,8 @@ test_away_mode_retries_unreclaimable_runtime_watcher_lock_drift() {
   stop_daemon_pid "$daemon_pid"
   kill "$foreign_pid" 2>/dev/null || true
   wait "$foreign_pid" 2>/dev/null || true
+  fm_test_unregister_pid "$foreign_pid"
+  assert_external_pid_stopped "$hosted_pid" "hosted away-mode watcher"
   pass "away-mode daemon keeps retrying and buffers escalation on unreclaimable runtime watcher drift"
 }
 
@@ -2463,6 +2647,10 @@ test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
 test_afk_start_keeps_identityless_live_away_daemon
 test_afk_start_refuses_identityless_live_neutral_daemon
+test_afk_start_reclaims_identityless_lock_reused_by_non_daemon
+test_afk_start_reclaims_identityless_lock_with_daemon_name_as_argument
+test_daemon_prelock_startup_failure_preserves_existing_away_state
+test_daemon_lock_contention_preserves_existing_away_state
 test_daemon_state_root_uses_fm_home
 test_classify_routine_signal_self
 test_classify_terminal_signal_escalates
@@ -2569,3 +2757,4 @@ test_away_mode_retries_unreclaimable_runtime_watcher_lock_drift
 test_away_mode_refuses_mismatched_live_watcher_lock
 test_away_mode_readiness_waits_for_startup_validation
 test_away_mode_flag_keeps_daemon_injection_path
+test_daemon_suite_reaps_hosted_watchers

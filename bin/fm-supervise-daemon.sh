@@ -1480,15 +1480,31 @@ fm_super_main() {
   local CRASH_BACKOFF=${FM_CRASH_BACKOFF:-$CRASH_BACKOFF_DEFAULT}
   local CRASH_NORMAL_SLEEP=${FM_CRASH_NORMAL_SLEEP:-$CRASH_NORMAL_SLEEP_DEFAULT}
   local BACKEND="" TARGET="" backend_source="" target_source=""
+  local LOCK_HELD=0
   [ "$MODE" = away ] && AWAY_MODE=1
+  startup_live_away_state() {
+    local pid recorded live
+    [ "$(cat "$MODEFILE" 2>/dev/null || true)" = away ] || return 1
+    pid=$(cat "$PIDFILE" 2>/dev/null | tr -d '[:space:]' || true)
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    recorded=$(cat "$IDENTITYFILE" 2>/dev/null || true)
+    [ -n "$recorded" ] || return 1
+    live=$(fm_pid_identity "$pid") || return 1
+    [ "$live" = "$recorded" ]
+  }
   startup_fail() {
     local rc=${1:-1}
     fm_lock_release "$LOCK" 2>/dev/null || true
-    rm -f "$PIDFILE" 2>/dev/null || true
-    rm -f "$MODEFILE" 2>/dev/null || true
-    rm -f "$IDENTITYFILE" 2>/dev/null || true
+    if [ "$LOCK_HELD" -eq 1 ]; then
+      rm -f "$PIDFILE" 2>/dev/null || true
+      rm -f "$MODEFILE" 2>/dev/null || true
+      rm -f "$IDENTITYFILE" 2>/dev/null || true
+    fi
     if [ "$AWAY_MODE" -eq 1 ] && [ "${FM_AFK_START_OWNS_FLAG:-0}" = 1 ]; then
-      rm -f "$STATE/.afk" 2>/dev/null || true
+      if [ "$LOCK_HELD" -eq 1 ] || ! startup_live_away_state; then
+        rm -f "$STATE/.afk" 2>/dev/null || true
+      fi
     fi
     exit "$rc"
   }
@@ -1503,6 +1519,9 @@ fm_super_main() {
 
   # --- single instance (portable lock, no flock dependency) ------------------
   if ! fm_lock_try_acquire "$LOCK"; then
+    # Another claimant owns the singleton. Do not remove a caller-created .afk
+    # here: it may belong to the concurrent away startup that won the lock.
+    # fm-afk-start.sh reclaims provably stale/non-daemon locks before exec.
     if [ -n "${FM_LOCK_HELD_PID:-}" ]; then
       echo "error: another fm-supervise-daemon is already running (pid $FM_LOCK_HELD_PID, lock $LOCK held)" >&2
     else
@@ -1510,6 +1529,7 @@ fm_super_main() {
     fi
     exit 1
   fi
+  LOCK_HELD=1
   echo "$$" > "$PIDFILE"
   local lock_identity_tmp
   lock_identity_tmp=$(mktemp "$STATE/.supervise-daemon.lock-identity.XXXXXX") || {

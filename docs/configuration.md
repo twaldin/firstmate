@@ -101,6 +101,7 @@ Start it directly with `bin/fm-supervise-daemon.sh --neutral-host`.
 Use it instead of the plain `bin/fm-watch-arm.sh` re-arm loop only when a home deliberately wants the reaper-surviving liveness host and has another path to notice and drain queued wakes.
 Neutral host mode does not provide harness background-task completion or injection.
 Create `config/neutral-host-drain-path` only for homes whose turn-end guard should allow in-flight work under a neutral host while the queue is empty because another configured path drains `state/.wake-queue`.
+That acknowledgement is deliberately per-home and is not inherited by secondmate homes.
 Both paths share the same watcher lock and liveness beacon, so `fm-watch-arm.sh` remains an honest verifier.
 The `/afk` sub-supervisor starts the same daemon with the explicit away-mode opt-in and injects escalation digests into firstmate's own pane independently of where new task endpoints are spawned.
 `bin/fm-afk-start.sh` owns direct `/afk` startup: it writes `state/.afk` before foregrounding the daemon, and the daemon removes that fresh flag again if startup validation fails before ready mode and pid identity are published.

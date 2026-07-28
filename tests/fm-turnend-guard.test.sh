@@ -547,6 +547,7 @@ test_hook_blocks_neutral_daemon_hosted_watcher_without_drain_ack() {
   wait "$watcher_pid" 2>/dev/null || true
   expect_code 2 "$status" "hook must block a neutral daemon-hosted watcher with in-flight work until a drain path is acknowledged"
   assert_contains "$out" 'watcher is daemon-hosted in mode=neutral without verified away-mode ownership' "neutral daemon-hosted no-ack block must explain missing wake delivery"
+  assert_contains "$out" 'config/neutral-host-drain-path' "neutral daemon-hosted no-ack block must name the acknowledgement file"
   pass "fm-turnend-guard: blocks neutral daemon-hosted watcher without a configured drain acknowledgement"
 }
 

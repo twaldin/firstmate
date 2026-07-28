@@ -94,12 +94,23 @@ daemon_pid_matches() {
 }
 
 daemon_pid_command_matches() {
-  local pid=$1 command
+  local pid=$1 mode=${2:-} command escaped_script
   command=$(ps -p "$pid" -o command= 2>/dev/null || true)
-  case "$command" in
-    *"$FM_AFK_DAEMON"*|*"fm-supervise-daemon.sh"*) return 0 ;;
+  escaped_script=$(printf '%s\n' "$FM_AFK_DAEMON" | sed 's/[][(){}.^$*+?|\\/]/\\&/g')
+  case "$mode" in
+    away)
+      printf '%s\n' "$command" | grep -Eq "(^|[[:space:]])($escaped_script|[^[:space:]]+/fm-supervise-daemon\\.sh)[[:space:]].*--away-mode([[:space:]]|$)"
+      return
+      ;;
+    neutral-host|neutral)
+      printf '%s\n' "$command" | grep -Eq "(^|[[:space:]])($escaped_script|[^[:space:]]+/fm-supervise-daemon\\.sh)[[:space:]].*--neutral-host([[:space:]]|$)"
+      return
+      ;;
+    *)
+      printf '%s\n' "$command" | grep -Eq "(^|[[:space:]])($escaped_script|[^[:space:]]+/fm-supervise-daemon\\.sh)([[:space:]]|$)"
+      return
+      ;;
   esac
-  return 1
 }
 
 daemon_lock_pid() {
@@ -109,17 +120,18 @@ daemon_lock_pid() {
 }
 
 daemon_lock_held_by_live_daemon() {
-  local owner pid identity
+  local owner pid identity mode
   owner=$(daemon_lock_owner) || return 1
   pid=$(cat "$owner/pid" 2>/dev/null || true)
   fm_pid_alive "$pid" || return 1
+  mode=$(cat "$FM_AFK_STATE/.supervise-daemon.mode" 2>/dev/null || true)
   identity=$(cat "$owner/pid-identity" 2>/dev/null || true)
   if [ -n "$identity" ]; then
     daemon_pid_matches "$pid" "$owner" || return 1
   else
-    daemon_pid_command_matches "$pid" || return 1
+    daemon_pid_command_matches "$pid" "$mode" || return 1
   fi
-  [ "$(cat "$FM_AFK_STATE/.supervise-daemon.mode" 2>/dev/null || true)" = away ]
+  [ "$mode" = away ]
 }
 
 daemon_lock_held_by_live_any_daemon() {
@@ -142,13 +154,26 @@ daemon_lock_has_reused_pid() {
 }
 
 daemon_lock_held_by_live_ambiguous_daemon() {
-  local owner pid identity
+  local owner pid identity mode
   owner=$(daemon_lock_owner) || return 1
   pid=$(cat "$owner/pid" 2>/dev/null || true)
   fm_pid_alive "$pid" || return 1
   identity=$(cat "$owner/pid-identity" 2>/dev/null || true)
   [ -z "$identity" ] || return 1
-  daemon_pid_command_matches "$pid"
+  mode=$(cat "$FM_AFK_STATE/.supervise-daemon.mode" 2>/dev/null || true)
+  daemon_pid_command_matches "$pid" "$mode"
+}
+
+daemon_lock_has_identityless_reused_pid() {
+  local owner pid identity mode
+  owner=$(daemon_lock_owner) || return 1
+  pid=$(cat "$owner/pid" 2>/dev/null || true)
+  fm_pid_alive "$pid" || return 1
+  identity=$(cat "$owner/pid-identity" 2>/dev/null || true)
+  [ -z "$identity" ] || return 1
+  mode=$(cat "$FM_AFK_STATE/.supervise-daemon.mode" 2>/dev/null || true)
+  daemon_pid_command_matches "$pid" "$mode" && return 1
+  return 0
 }
 
 daemon_wait_for_stop() {
@@ -198,7 +223,7 @@ fm_afk_start_main() {
     echo "afk: live supervise daemon pid=$pid has no lock identity; stop it before entering away mode" >&2
     fm_afk_start_clear_fresh_flag
     return 1
-  elif daemon_lock_has_reused_pid; then
+  elif daemon_lock_has_reused_pid || daemon_lock_has_identityless_reused_pid; then
     fm_lock_remove_path "$FM_AFK_LOCK" 2>/dev/null || true
   fi
 
