@@ -131,6 +131,22 @@ test_classifier_primitives() {
   status_is_captain_relevant "done: b" || fail "done: not recognized as captain-relevant"
   status_is_captain_relevant "needs-decision [key=q1]: b" || fail "keyed needs-decision not recognized as captain-relevant"
   status_is_captain_relevant "working: b" && fail "working: wrongly recognized as captain-relevant"
+  # Incident regression: status producers prefixed ISO timestamps, whose internal
+  # colons previously made the parser expose a timestamp fragment as the verb.
+  [ -z "$(status_line_verb '[2026-07-29T01:13 UTC] blocked: main red')" ] \
+    || fail "bracketed timestamp prefix was exposed as a status verb"
+  [ -z "$(status_line_verb '2026-07-29T04:51:05Z paused: waiting')" ] \
+    || fail "ISO timestamp prefix was exposed as a status verb"
+  status_is_captain_relevant '[2026-07-29T01:13 UTC] blocked: main red' \
+    && fail "timestamp-prefixed blocked line was accepted as valid status grammar"
+  status_is_captain_relevant '  [2026-07-29T01:13 UTC] blocked: main red' \
+    && fail "indented timestamp-prefixed blocked line was accepted as valid status grammar"
+  status_is_captain_relevant '  2026-07-29T04:51:05Z blocked: main red' \
+    && fail "indented ISO timestamp-prefixed blocked line was accepted as valid status grammar"
+  status_is_paused '2026-07-29T04:51:05Z paused: waiting' \
+    && fail "timestamp-prefixed paused line was accepted as valid status grammar"
+  [ "$(status_line_verb 'blocked: [2026-07-29T01:13Z] main red')" = blocked ] \
+    || fail "verb-first status with timestamp in its note was rejected"
   # Incident regression: free-text "merged" inside a nonterminal working: line must
   # not become captain-relevant (AFK false-terminal path).
   status_is_captain_relevant \

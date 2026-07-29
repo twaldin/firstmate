@@ -37,6 +37,14 @@ field() {  # <line> <index>
   printf '%s\n' "$1" | awk -F '\t' -v i="$2" '{print $i}'
 }
 
+file_mode() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %Lp "$1" 2>/dev/null
+  else
+    stat -c %a "$1" 2>/dev/null
+  fi
+}
+
 test_list_redacts_tokens() {
   local dir state out full_access full_refresh
   dir="$TMP_ROOT/list/accounts"
@@ -147,7 +155,7 @@ EOF
   [ "$(field "$out" 1)" = "claude-alpha" ] || fail "refreshing select should still choose alpha"
   [ "$(jq -r '.access_token' "$file")" = "fake-access-new-CCCC" ] || fail "access token was not rotated in account file"
   [ "$(jq -r '.refresh_token' "$file")" = "fake-refresh-new-DDDD" ] || fail "refresh token was not rotated in account file"
-  [ "$(stat -f '%Lp' "$file")" = "600" ] || fail "account file mode should stay 0600"
+  [ "$(file_mode "$file")" = "600" ] || fail "account file mode should stay 0600"
   assert_no_grep "fake-refresh-old-RRRR" "$log" "refresh token must not appear in curl argv"
   assert_grep "fake-refresh-old-RRRR" "$req" "refresh request body should carry the old refresh token in the temp file"
   pass "near-expiry account refreshes through a mock endpoint and persists the new pair"
@@ -254,7 +262,11 @@ test_fm_spawn_leaves_non_claude_harness_alone_when_enabled() {
   expect_code 0 "$status" "codex spawn with Claude rotation enabled should succeed"
   launch=$(cat "$LAUNCH_LOG")
 
-  assert_contains "$launch" "codex --dangerously-bypass-approvals-and-sandbox" "codex launch should still be codex"
+  case "$launch" in
+    codex\ *) ;;
+    *) fail "codex launch should still start with codex: $launch" ;;
+  esac
+  assert_contains "$launch" "--dangerously-bypass-approvals-and-sandbox" "codex launch lost its approval/sandbox flag"
   assert_not_contains "$launch" "fm-claude-accounts.sh" "non-claude launch must not use Claude OAuth helper"
   assert_no_grep "claude_oauth_account" "$HOME_DIR/state/$id.meta" "non-claude meta must not record Claude account"
   pass "fm-spawn does not inject Claude OAuth rotation into non-claude harnesses"

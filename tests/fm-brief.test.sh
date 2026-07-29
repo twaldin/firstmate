@@ -68,6 +68,16 @@ test_ship_modes_generate_clean_briefs() {
     assert_grep "{TASK}" "$brief" "$id: brief missing the {TASK} placeholder"
     assert_grep "mid-task \`working:\` line (including setup complete) is nonterminal" "$brief" \
       "$id: brief missing nonterminal working:/setup-complete gate protection"
+    assert_grep "Every line starts with the verb" "$brief" \
+      "$id: brief missing verb-first status grammar"
+    assert_grep "inspect \`~/brain/BRAIN.md\`" "$brief" \
+      "$id: brief missing brain intake preflight"
+    assert_grep 'find .agent/skills .agents/skills .claude/skills -name SKILL.md' "$brief" \
+      "$id: brief missing repo-skills-first preflight paths"
+    assert_no_grep "# Herdr lifecycle declaration - NOT ENABLED" "$brief" \
+      "$id: ordinary brief retained an irrelevant Herdr section"
+    assert_no_grep "# Project memory" "$brief" \
+      "$id: ordinary brief retained an unrequested project-memory section"
     assert_no_grep "EOF" "$brief" "$id: brief leaked a heredoc EOF marker (unterminated heredoc)"
   done
   pass "fm-brief.sh: no-mistakes/direct-PR/local-only briefs generate cleanly"
@@ -119,21 +129,21 @@ test_no_mistakes_dod_wording() {
   pass "fm-brief.sh: no-mistakes DOD wording avoids the apostrophe regression"
 }
 
-test_ship_project_memory_wording() {
+test_ship_project_memory_is_opt_in() {
   local home id brief
   home="$TMP_ROOT/project-memory-home"
   mkdir -p "$home/data"
   id="brief-memory-c1"
-  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --project-memory >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
   assert_present "$brief" "brief was not scaffolded"
-  assert_grep "Record only project knowledge useful to almost every future session." "$brief" \
+  assert_grep "record only knowledge useful to almost every future session" "$brief" \
     "project-memory contract lost the durable-knowledge bar"
   assert_grep "prefer a pointer to the authoritative file, command, or doc over copying the detail" "$brief" \
     "project-memory contract lost pointer-over-copy guidance"
   assert_grep "lacks \`## Maintaining this file\`, add that short self-governance section" "$brief" \
     "project-memory contract lost the self-governance add-in-same-pass rule"
-  pass "fm-brief.sh: ship project-memory wording carries the AGENTS.md authoring bar"
+  pass "fm-brief.sh: project-memory contract is explicit and retains the AGENTS.md authoring bar"
 }
 
 test_herdr_lab_contract_is_explicit_and_complete() {
@@ -184,7 +194,7 @@ test_herdr_lab_contract_quotes_foreign_firstmate_path() {
   pass "fm-brief.sh: --herdr-lab uses its quoted Firstmate-owned helper path"
 }
 
-test_herdr_lab_omission_is_loud_for_ship_and_scout() {
+test_herdr_lab_omission_drops_irrelevant_section() {
   local home id brief
   home="$TMP_ROOT/herdr-gate-home"
   mkdir -p "$home/data"
@@ -196,12 +206,12 @@ test_herdr_lab_omission_is_loud_for_ship_and_scout() {
       FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" firstmate >/dev/null 2>&1
     fi
     brief="$home/data/$id/brief.md"
-    assert_grep "# Herdr lifecycle declaration - NOT ENABLED" "$brief" \
-      "$kind brief silently omitted the Herdr declaration"
-    assert_grep "regenerate the brief with \`--herdr-lab\` before dispatch" "$brief" \
-      "$kind brief missing the fail-visible regeneration instruction"
+    assert_no_grep "Herdr lifecycle" "$brief" \
+      "$kind brief retained Herdr text without --herdr-lab"
+    assert_no_grep "--herdr-lab" "$brief" \
+      "$kind brief retained Herdr setup guidance without --herdr-lab"
   done
-  pass "fm-brief.sh: ship and scout scaffolds make omitted Herdr intent fail-visible"
+  pass "fm-brief.sh: ordinary ship and scout scaffolds omit Herdr sections"
 }
 
 test_secondmate_no_projects_charter() {
@@ -288,7 +298,7 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
         ;;
     esac
     brief="$home/data/$id/brief.md"
-    assert_grep "States: working, needs-decision, blocked, awaiting, done, failed." "$brief" \
+    assert_grep "States: working, needs-decision, blocked, awaiting, resolved, done, failed." "$brief" \
       "$kind brief did not render the configured pause verb in its states list"
     # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
     assert_grep 'Use `awaiting: {why}`' "$brief" \
@@ -321,6 +331,56 @@ test_scout_and_secondmate_load_decision_hold_policy() {
   pass "fm-brief.sh: investigation and visual-review completions load the shared decision policy"
 }
 
+test_remote_run_receipt_is_opt_in() {
+  local home id brief
+  home="$TMP_ROOT/remote-run-home"
+  mkdir -p "$home/data"
+  id="brief-remote-run-r1"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --remote-run >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_grep "# Remote-run receipt" "$brief" \
+    "remote-run brief omitted its receipt section"
+  assert_grep "\`environment\`, \`endpoint\`, \`runId\`, \`ownerLane\`, \`startedAt\`, \`pollerProcess\`, and \`terminalState\`" "$brief" \
+    "remote-run brief omitted required receipt fields"
+  assert_grep "$home/data/$id/run-receipt.md" "$brief" \
+    "remote-run brief did not name its durable task-owned receipt"
+  assert_grep "inspect the receipt before creating another run" "$brief" \
+    "remote-run brief omitted reconnect/retry deduplication"
+
+  id="brief-no-remote-run-r2"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_no_grep "# Remote-run receipt" "$brief" \
+    "ordinary brief retained an unrequested remote-run section"
+  pass "fm-brief.sh: remote-run receipts are explicit and durable"
+}
+
+test_pr_lifecycle_doctrine() {
+  local home brief
+  home="$TMP_ROOT/pr-lifecycle-home"
+  write_registry "$home"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" nm-pr some-proj >/dev/null 2>&1
+  brief="$home/data/nm-pr/brief.md"
+  assert_grep "own the resulting PR from creation until its checks pass, required approvals are present, and its review threads are resolved" "$brief" \
+    "no-mistakes brief omitted end-to-end PR ownership"
+  assert_grep "respond with \`FIX_NOW\`" "$brief" \
+    "no-mistakes brief omitted automatic scoped-fix action"
+  assert_grep "Product, design, destructive, irreversible, and security-sensitive findings require escalation" "$brief" \
+    "no-mistakes brief omitted higher-authority decision boundary"
+
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" direct-pr direct-proj >/dev/null 2>&1
+  brief="$home/data/direct-pr/brief.md"
+  assert_grep "own the PR from creation until its checks pass, required approvals are present, and its review threads are resolved" "$brief" \
+    "direct-PR brief omitted end-to-end PR ownership"
+  assert_grep "apply and verify every clearly scoped correction immediately" "$brief" \
+    "direct-PR brief omitted automatic scoped fixes"
+  assert_grep "product, design, destructive, irreversible, or security-sensitive choice" "$brief" \
+    "direct-PR brief omitted higher-authority decision boundary"
+  assert_no_grep "no-mistakes pipeline" "$brief" \
+    "direct-PR brief retained irrelevant no-mistakes prose"
+  pass "fm-brief.sh: PR workers own birth through terminal review and separate fixes from decisions"
+}
+
 # Scout and secondmate paths still scaffold well-formed briefs.
 test_scout_and_secondmate_scaffold() {
   local brief
@@ -346,12 +406,14 @@ test_help_includes_entire_header
 test_ship_modes_generate_clean_briefs
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
-test_ship_project_memory_wording
+test_ship_project_memory_is_opt_in
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path
-test_herdr_lab_omission_is_loud_for_ship_and_scout
+test_herdr_lab_omission_drops_irrelevant_section
 test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
 test_secondmate_no_projects_charter
 test_pause_verb_override_renders_all_brief_scaffolds
 test_scout_and_secondmate_load_decision_hold_policy
+test_remote_run_receipt_is_opt_in
+test_pr_lifecycle_doctrine
 test_scout_and_secondmate_scaffold

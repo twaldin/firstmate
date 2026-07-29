@@ -7,7 +7,7 @@
 // which is spawned exactly as MCP clients spawn it.
 
 import { spawn } from 'node:child_process'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -85,8 +85,7 @@ async function main(): Promise<void> {
         access: { uri: 'mongodb+srv://user:password@cluster.example/prod' },
         updatedAt: nowMs(),
     })
-    const { execSync } = await import('node:child_process')
-    const perms = execSync(`stat -f '%A' '${store.filePath}'`).toString().trim()
+    const perms = (statSync(store.filePath).mode & 0o777).toString(8)
     assert(perms === '600', `store file mode is 0600 (got ${perms})`)
 
     say('Render claude/codex/pi config and assert the no-secret invariant')

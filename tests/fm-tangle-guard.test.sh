@@ -280,11 +280,11 @@ test_spawn_tmux_window_construction() {
   expect_code 0 "$status" "spawn into a genuine worktree should succeed"
   assert_contains "$out" "spawned rec-win-gg7" "recording spawn did not report success"
 
-  # Bug 1 fix: append-form window creation (trailing colon on the session target).
-  assert_grep "new-window -dP -F #{window_id} -t firstmate: -n fm-rec-win-gg7" "$rec" \
-    "new-window must append at the session (trailing colon) and capture the window id"
-  assert_no_grep "new-window -dP -F #{window_id} -t firstmate -n" "$rec" \
-    "new-window must not target the bare session name (collides under base-index 1)"
+  # Bug 1 fix: append-form window creation (trailing colon on the project-scoped session target).
+  assert_grep "new-window -dP -F #{window_id} -t fm-spawn-rec-proj: -n fm-rec-win-gg7" "$rec" \
+    "new-window must append at the project session (trailing colon) and capture the window id"
+  assert_no_grep "new-window -dP -F #{window_id} -t fm-spawn-rec-proj -n" "$rec" \
+    "new-window must not target the bare project session name (collides under base-index 1)"
 
   # Bug 2 fix (a): pin the window name against automatic-rename / allow-rename.
   assert_grep "set-window-option -t @spawnwid automatic-rename off" "$rec" \
