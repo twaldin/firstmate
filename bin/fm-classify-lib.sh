@@ -99,7 +99,7 @@ status_is_terminal_verb() {
 # only lines without those leading verbs may still match free-text tokens for
 # legacy bare lines such as "merged" or "PR ready".
 status_is_captain_relevant() {
-  local line=$1 verb
+  local line=$1 verb trimmed
   [ -n "$line" ] || return 1
   status_is_paused "$line" && return 1
   verb=$(status_line_verb "$line")
@@ -111,6 +111,14 @@ status_is_captain_relevant() {
   if [ -z "${FM_CAPTAIN_RE+x}" ]; then
     case "$verb" in
       done|needs-decision|blocked|failed) return 0 ;;
+    esac
+  fi
+  # Timestamp-prefixed protocol lines are malformed, not legacy free text.
+  # Keep accepting historical bare phrases that happen to contain a URL.
+  if [ -z "$verb" ]; then
+    trimmed=${line#"${line%%[![:space:]]*}"}
+    case "$trimmed" in
+      \[[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*) return 1 ;;
     esac
   fi
   printf '%s' "$line" | grep -qiE "${FM_CAPTAIN_RE:-$FM_CLASSIFY_CAPTAIN_RE_DEFAULT}"
@@ -159,12 +167,17 @@ status_is_paused_or_captain_held() {  # <status-line>
 # one-open-decision-per-task behavior (a bare "resolved:" closes "default").
 # The three parsers are pure reads of a single line; the verb parser strips any
 # key token before the colon so the leading word is recovered cleanly.
-status_line_verb() {  # <status-line> -> leading verb word
+# A valid line is verb-first. Timestamp or prose prefixes are rejected instead
+# of being exposed as accidental verbs, even when the prefix itself has colons.
+status_line_verb() {  # <status-line> -> leading verb word, or empty if malformed
   local v=${1%%:*}
   v=${v%%\[key=*}
   v=${v#"${v%%[![:space:]]*}"}
   v=${v%"${v##*[![:space:]]}"}
-  printf '%s' "$v"
+  case "$v" in
+    ''|[!A-Za-z]*|*[!A-Za-z0-9-]*) return 0 ;;
+    *) printf '%s' "$v" ;;
+  esac
 }
 status_line_note() {  # <status-line> -> text after the first colon, trimmed
   case "$1" in
