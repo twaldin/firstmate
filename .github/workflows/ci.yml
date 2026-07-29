@@ -27,9 +27,17 @@ jobs:
   tests:
     name: Behavior tests
     runs-on: ubuntu-latest
-    # The suite should finish in ~2-3 minutes; this generous cap fails loudly on a
-    # hung watcher or tmux test instead of riding GitHub's 360-minute default.
-    timeout-minutes: 15
+    # Measured full-suite wall is ~16 min on a hosted ubuntu-24.04 runner: the suite
+    # is dominated by real watcher, lock, daemon, and tmux tests that must spend real
+    # wall-clock time in sleeps and timing thresholds. The former 15m cap (written
+    # when the suite genuinely ran in ~2-3 min) cancelled the job at 93% complete
+    # with zero failing assertions, so it had become a false alarm rather than a
+    # tripwire. This cap is a hang tripwire above observed suite wall, not the
+    # expected healthy end, and still fails far below GitHub's 360-minute default.
+    # Runtime, not this cap, is the real constraint: the upstream repo has since
+    # split this lane into duration-balanced shards (bin/fm-test-run.sh); adopting
+    # that here is the durable fix and lets this cap come back down.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
