@@ -37,6 +37,14 @@ field() {  # <line> <index>
   printf '%s\n' "$1" | awk -F '\t' -v i="$2" '{print $i}'
 }
 
+file_mode() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %Lp "$1" 2>/dev/null
+  else
+    stat -c %a "$1" 2>/dev/null
+  fi
+}
+
 test_list_redacts_tokens() {
   local dir state out full_access full_refresh
   dir="$TMP_ROOT/list/accounts"
@@ -147,7 +155,7 @@ EOF
   [ "$(field "$out" 1)" = "claude-alpha" ] || fail "refreshing select should still choose alpha"
   [ "$(jq -r '.access_token' "$file")" = "fake-access-new-CCCC" ] || fail "access token was not rotated in account file"
   [ "$(jq -r '.refresh_token' "$file")" = "fake-refresh-new-DDDD" ] || fail "refresh token was not rotated in account file"
-  [ "$(stat -f '%Lp' "$file")" = "600" ] || fail "account file mode should stay 0600"
+  [ "$(file_mode "$file")" = "600" ] || fail "account file mode should stay 0600"
   assert_no_grep "fake-refresh-old-RRRR" "$log" "refresh token must not appear in curl argv"
   assert_grep "fake-refresh-old-RRRR" "$req" "refresh request body should carry the old refresh token in the temp file"
   pass "near-expiry account refreshes through a mock endpoint and persists the new pair"
