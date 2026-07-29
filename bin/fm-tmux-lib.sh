@@ -170,7 +170,7 @@ fm_tmux_submit_region_text() {  # <target> <start> <end>
 }
 
 fm_tmux_submit_region_state() {  # <target> <text> <start> <end> -> empty|pending|unknown
-  local target=$1 text=$2 start=$3 end=$4 region needle haystack match_chars
+  local target=$1 text=$2 start=$3 end=$4 region needle haystack match_chars visible_text
   region=$(fm_tmux_submit_region_text "$target" "$start" "$end") || { printf 'unknown'; return 0; }
   if printf '%s' "$region" | grep -qiE "${FM_TMUX_QUEUED_ACK_RE:-$FM_TMUX_QUEUED_ACK_REGEX_DEFAULT}"; then
     printf 'empty'; return 0
@@ -179,8 +179,13 @@ fm_tmux_submit_region_state() {  # <target> <text> <start> <end> -> empty|pendin
   case "$match_chars" in ''|*[!0-9]*) match_chars=160 ;; esac
   [ "$match_chars" -ge 1 ] || match_chars=160
   # Match the visible tail: wrapped composers keep the end of a long message
-  # near cursor_y, while control bytes such as the AFK sentinel do not render.
-  needle=$(printf '%s' "$text" | LC_ALL=C tr -d '[:space:][:cntrl:]' | tail -c "$match_chars")
+  # near cursor_y. The AFK sentinel is intentionally zero-width and absent from
+  # capture-pane output, so remove it before comparing rendered content.
+  visible_text=$text
+  if [ -n "${FM_INJECT_MARK:-}" ]; then
+    visible_text=${visible_text//"$FM_INJECT_MARK"/}
+  fi
+  needle=$(printf '%s' "$visible_text" | LC_ALL=C tr -d '[:space:][:cntrl:]' | tail -c "$match_chars")
   [ -n "$needle" ] || { printf 'unknown'; return 0; }
   haystack=$(printf '%s' "$region" | LC_ALL=C tr -d '[:space:][:cntrl:]')
   case "$haystack" in
@@ -250,19 +255,26 @@ fm_tmux_submit_enter_core() {  # <target> <retries> <enter-sleep> [text start en
     tmux send-keys -t "$target" Enter 2>/dev/null || true
     sleep "$sleep_s"
     state=$(fm_tmux_composer_state "$target")
-    [ "$state" = pending ] || { printf '%s' "$state"; return 0; }
     if [ -n "$text" ] && [ -n "$start" ] && [ -n "$end" ]; then
       region_state=$(fm_tmux_submit_region_state "$target" "$text" "$start" "$end")
-      [ "$region_state" = empty ] && { printf 'empty'; return 0; }
+      case "$region_state" in
+        pending) state=pending ;;
+        empty) printf 'empty'; return 0 ;;
+      esac
     fi
+    [ "$state" = pending ] || { printf '%s' "$state"; return 0; }
     i=$((i + 1))
     [ "$i" -lt "$retries" ] || break
   done
-  # Retries exhausted, composer still shows pending.
-  # If the pane is busy (agent mid-turn), the harness accepted the Enter
-  # and queued the message for processing when the current turn ends.
-  # Treat it as submitted so the caller does not re-send.
-  # On an idle pane, keep reporting pending - a genuine swallow.
+  # Retries exhausted. An AFK escalation still visible in the bounded composer
+  # region is positive evidence of a swallowed Enter even if a generic busy
+  # footer is visible. Other harness messages preserve the historical busy
+  # fallback below because opencode has verified busy-queue semantics.
+  if [ "${region_state:-}" = pending ] && [ -n "${FM_INJECT_MARK:-}" ]; then
+    case "$text" in
+      "$FM_INJECT_MARK"*) printf 'pending'; return 0 ;;
+    esac
+  fi
   if fm_pane_is_busy "$target"; then
     printf 'empty'
   else
