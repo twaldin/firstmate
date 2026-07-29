@@ -511,6 +511,20 @@ test_target_ready_fails_when_target_absent() {
   pass "fm_backend_cmux_target_ready: fails when the workspace/surface is not found (list-panes structural check)"
 }
 
+test_target_ready_preserves_list_panes_failure() {
+  local dir fb status
+  dir="$TMP_ROOT/ready-command-failure"; mkdir -p "$dir/responses"
+  # A command failure must win even if stdout happens to contain matching JSON.
+  cmux_panes_response "$dir" 1 "bbbbbbbb-1111-1111-1111-111111111111"
+  printf '1\n' > "$dir/responses/1.exit"
+  fb=$(make_cmux_fakebin "$dir")
+  PATH="$fb:$PATH" FM_CMUX_LOG="$dir/log" FM_CMUX_RESPONSES="$dir/responses" \
+    bash -c '. "$0/bin/backends/cmux.sh"; fm_backend_cmux_target_ready "aaaaaaaa-0000-0000-0000-000000000000:bbbbbbbb-1111-1111-1111-111111111111"' "$ROOT"
+  status=$?
+  [ "$status" -ne 0 ] || fail "target_ready should preserve a failed list-panes command even with matching JSON"
+  pass "fm_backend_cmux_target_ready: preserves list-panes command failure before parsing JSON"
+}
+
 test_target_ready_checks_expected_label() {
   local dir fb title
   dir="$TMP_ROOT/ready-label-ok"; mkdir -p "$dir/responses"
@@ -1034,6 +1048,7 @@ test_ensure_running_fails_fast_on_unauth_without_launching
 test_create_task_refuses_duplicate_label
 test_create_task_creates_and_parses_ids
 test_target_ready_fails_when_target_absent
+test_target_ready_preserves_list_panes_failure
 test_target_ready_checks_expected_label
 test_target_ready_rejects_label_mismatch
 test_capture_trims_locally
